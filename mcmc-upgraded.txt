@@ -100,6 +100,19 @@ define('MCMC_ALLOWED_EVENT_TYPES', [
 ]);
 define('MCMC_ALLOWED_STATUSES', ['pending','running','completed','failed','cancelled']);
 
+// --- Input parameter bounds (used server-side for clamping in SECTION 15)
+// These must match MCMC_JS.PARAM_*_MIN/MAX in the JavaScript central config. ---
+if (!defined('MCMC_PARAM_W_MIN'))   define('MCMC_PARAM_W_MIN',   100);
+if (!defined('MCMC_PARAM_W_MAX'))   define('MCMC_PARAM_W_MAX',   40000);
+if (!defined('MCMC_PARAM_B_MIN'))   define('MCMC_PARAM_B_MIN',   0);
+if (!defined('MCMC_PARAM_B_MAX'))   define('MCMC_PARAM_B_MAX',   2000);
+if (!defined('MCMC_PARAM_K_MIN'))   define('MCMC_PARAM_K_MIN',   0.0);
+if (!defined('MCMC_PARAM_K_MAX'))   define('MCMC_PARAM_K_MAX',   20.0);
+if (!defined('MCMC_PARAM_D_MIN'))   define('MCMC_PARAM_D_MIN',   0.001);
+if (!defined('MCMC_PARAM_D_MAX'))   define('MCMC_PARAM_D_MAX',   1.0);
+if (!defined('MCMC_PARAM_CL_MIN'))  define('MCMC_PARAM_CL_MIN',  100);
+if (!defined('MCMC_PARAM_CL_MAX'))  define('MCMC_PARAM_CL_MAX',  10000);
+
 // ==============================================================================
 // SECTION 2: JOOMLA BOOTSTRAP (UNCHANGED)
 // ==============================================================================
@@ -831,12 +844,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken() && isset($_P
     $extraNums= $db->quote(strip_tags(trim($_POST['extra_ball_numbers'] ?? '')));
     $genAt    = $db->quote(strip_tags(trim($_POST['generated_at']       ?? '')));
     $saved    = $db->quote(date('Y-m-d H:i:s'));
-    // [SECURITY] Clamp all numeric params server-side — never trust client values
-    $W  = min(40000, max(100,   (int)($_POST['walks']     ?? 1500)));
-    $B  = min(2000,  max(0,     (int)($_POST['burn_in']   ?? 70)));
-    $K  = min(20.0,  max(0.0,   (float)($_POST['laplace_k'] ?? 1.0)));
-    $D  = min(1.0,   max(0.001, (float)($_POST['decay']   ?? 0.02)));
-    $CL = min(10000, max(100,   (int)($_POST['chain_len'] ?? 3000)));
+    // [SECURITY] Clamp all numeric params server-side — never trust client values.
+    // Bounds are defined in SECTION 1 central config block for single-source-of-truth.
+    $W  = min(MCMC_PARAM_W_MAX,  max(MCMC_PARAM_W_MIN,  (int)($_POST['walks']     ?? 1500)));
+    $B  = min(MCMC_PARAM_B_MAX,  max(MCMC_PARAM_B_MIN,  (int)($_POST['burn_in']   ?? 70)));
+    $K  = min(MCMC_PARAM_K_MAX,  max(MCMC_PARAM_K_MIN,  (float)($_POST['laplace_k'] ?? 1.0)));
+    $D  = min(MCMC_PARAM_D_MAX,  max(MCMC_PARAM_D_MIN,  (float)($_POST['decay']   ?? 0.02)));
+    $CL = min(MCMC_PARAM_CL_MAX, max(MCMC_PARAM_CL_MIN, (int)($_POST['chain_len'] ?? 3000)));
 
     $q = $db->getQuery(true)
         ->select('l.game_id')
@@ -911,15 +925,29 @@ echo '[[script]]';
 echo 'window.lottoDraws = '      . json_encode($draws,     JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) . ';';
 echo 'window.lottoDrawDates = '  . json_encode($drawDates, JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) . ';';
 echo 'window.lottoConfig = '     . json_encode([
-    'pickSize'    => $lc['num_main_balls_drawn']  ?? null,
-    'hasExtra'    => $lc['has_extra_ball']         ?? false,
-    'extraCount'  => $lc['num_extra_balls_drawn']  ?? 0,
-    'rangeMain'   => isset($lc['max_main_ball_number'])  ? [1,(int)$lc['max_main_ball_number']]  : [],
-    'rangeExtra'  => isset($lc['max_extra_ball_number']) ? [1,(int)$lc['max_extra_ball_number']] : [],
-    'lotteryName' => $spec['lotteryName'] ?? '',
-    'scoreWMain'  => isset($lc['score_weight_main'])  ? (int)$lc['score_weight_main']  : 5,
-    'scoreWExtra' => isset($lc['score_weight_extra']) ? (int)$lc['score_weight_extra'] : 2,
-    'gameId'      => $gameIdDb,
+    'pickSize'          => $lc['num_main_balls_drawn']  ?? null,
+    'hasExtra'          => $lc['has_extra_ball']         ?? false,
+    'extraCount'        => $lc['num_extra_balls_drawn']  ?? 0,
+    'rangeMain'         => isset($lc['max_main_ball_number'])  ? [1,(int)$lc['max_main_ball_number']]  : [],
+    'rangeExtra'        => isset($lc['max_extra_ball_number']) ? [1,(int)$lc['max_extra_ball_number']] : [],
+    'lotteryName'       => $spec['lotteryName'] ?? '',
+    'scoreWMain'        => isset($lc['score_weight_main'])  ? (int)$lc['score_weight_main']  : 5,
+    'scoreWExtra'       => isset($lc['score_weight_extra']) ? (int)$lc['score_weight_extra'] : 2,
+    'gameId'            => $gameIdDb,
+    // lotteryNumericId: the integer lottery_id from #__lotteries for save-form use.
+    // Resolved server-side to avoid client-side spoofing.
+    'lotteryNumericId'  => (function() use ($db, $gameIdDb) {
+        try {
+            $q2 = $db->getQuery(true)
+                ->select($db->quoteName('lottery_id'))
+                ->from($db->quoteName('#__lotteries'))
+                ->where($db->quoteName('game_id') . '=' . $db->quote($gameIdDb))
+                ->setLimit(1);
+            $db->setQuery($q2);
+            $val = $db->loadResult();
+            return $val ? (int)$val : 0;
+        } catch (\Exception $e) { return 0; }
+    })(),
 ], JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) . ';';
 echo 'window.mcmcLearningState = ' . json_encode([
     'source'        => $learningState['is_source']  ?? 'default',
@@ -1634,7 +1662,18 @@ var MCMC_JS = (function () {
         RR_W_GAP        : cfg.RR_W_GAP        || 0.20,
         RR_W_MOMENTUM   : cfg.RR_W_MOMENTUM   || 0.15,
         RR_W_VOLATILITY : cfg.RR_W_VOLATILITY || 0.10,
-        RR_W_AGREE      : cfg.RR_W_AGREE      || 0.30
+        RR_W_AGREE      : cfg.RR_W_AGREE      || 0.30,
+        /* Parameter bounds — must match PHP central config block server-side clamping */
+        PARAM_W_MIN     : 100,
+        PARAM_W_MAX     : 40000,
+        PARAM_B_MIN     : 0,
+        PARAM_B_MAX     : 2000,
+        PARAM_K_MIN     : 0.0,
+        PARAM_K_MAX     : 20.0,
+        PARAM_D_MIN     : 0.001,
+        PARAM_D_MAX     : 1.0,
+        PARAM_CL_MIN    : 100,
+        PARAM_CL_MAX    : 10000
     };
 }());
 
@@ -1706,12 +1745,16 @@ function fmt(v, n) {
 /* Escape HTML to prevent XSS in innerHTML assignments */
 function escHtml(str) {
     if (str === null || str === undefined) return '';
+    /* Encode &, <, >, ", ', and ` to prevent XSS in all HTML contexts.
+       Backtick is encoded as &#96; to prevent attribute injection in
+       older browsers. Replacements applied in order to prevent double-encoding. */
     return String(str)
         .replace(/&/g,  '&amp;')
         .replace(/</g,  '&lt;')
         .replace(/>/g,  '&gt;')
         .replace(/"/g,  '&quot;')
-        .replace(/'/g,  '&#39;');
+        .replace(/'/g,  '&#39;')
+        .replace(/`/g,  '&#96;');
 }
 
 /* Build plain object as hash-set from array */
@@ -2459,10 +2502,18 @@ function computeRankOverlap(listA, listB) {
  * @return {number} Penalty in [0,1]
  */
 function computeComplexityPenalty(walks, chainLen) {
-    var maxComplexity = 40000 * 10000;  // absolute maximum
+    /* maxComplexity: product of the maximum allowed walks (40000) and maximum
+       allowed chain length (10000). This gives the upper bound for the
+       complexity product = 400,000,000. Defined here as a named constant to
+       match the central config block param bounds (walks max=40000, CL max=10000). */
+    var MAX_WALKS     = 40000;
+    var MAX_CHAIN_LEN = 10000;
+    var maxComplexity = MAX_WALKS * MAX_CHAIN_LEN;  // 400,000,000
     var complexity = Math.max(0, walks * chainLen);
     var raw = complexity / maxComplexity;
-    /* Log scale to avoid penalizing mid-range too harshly */
+    /* Log scale: penalizes very high complexity without over-penalizing mid-range.
+       At max complexity (walks=40000, CL=10000): penalty=1.0.
+       At typical (walks=2700, CL=3000): raw=0.02, penalty~0.17 — very mild. */
     return Math.min(1, Math.log(1 + raw * 100) / Math.log(101));
 }
 
@@ -2535,8 +2586,14 @@ function rerankByFeatures(baseProbs, features, maxN, weights, alpha) {
         var normMom  = (f.momentum + 1) / 2;                 // [-1,1] -> [0,1]
         var normVol  = 1 - Math.min(1, f.volatility / volMax); // low vol = better
         var normAgree = baseProbs[b] / probMax;              // [0,1] agreement
-        /* Gap scoring: very long absences get a moderate boost (overdue) */
-        var gapScore = normGap * (1 - normGap) * 4; // peaks at gap=0.5 -> 1.0
+        /* Gap scoring: A parabolic (quadratic) function is used because:
+           - normGap=0 (appeared just now) should NOT get a strong boost (too fresh)
+           - normGap=0.5 (moderately absent) gets maximum boost = 1.0
+           - normGap=1.0 (never appeared or extremely old) gets no boost (stale/cold)
+           The formula normGap*(1-normGap)*4 is the unit parabola scaled to [0,1],
+           peaking at normGap=0.5. The factor 4 ensures the peak value equals 1.0.
+           This models the empirically common 'overdue' effect in lottery data. */
+        var gapScore = normGap * (1 - normGap) * 4;
         var featureScore = weights.freq       * normFreq
                          + weights.gap        * gapScore
                          + weights.momentum   * normMom
@@ -3665,18 +3722,24 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
         form.appendChild(inp);
     }
 
-    /* Joomla CSRF token must be included */
+    /* Joomla CSRF token: find by name length=32 AND all hex characters.
+       This is more robust than length alone and matches Joomla's token format. */
     var tokenEls = document.querySelectorAll('input[type=hidden]');
     for (var t = 0; t < tokenEls.length; t++) {
         var tel = tokenEls[t];
-        if (tel.name && tel.name.length === 32) {
+        if (tel.name && tel.name.length === 32 && /^[0-9a-f]{32}$/.test(tel.name)) {
             addHidden(tel.name, tel.value);
             break;
         }
     }
 
     addHidden('save_set',           '1');
-    addHidden('lottery_id',         (window.lottoConfig && window.lottoConfig.gameId) || '');
+    /* Note: lottery_id must be the numeric DB lottery_id, NOT the string game_id.
+       The server-side save handler casts this to int and validates it exists.
+       window.lottoConfig.lotteryNumericId should be set server-side if different
+       from gameId. Fallback to gameId only if no numeric ID is available. */
+    addHidden('lottery_id',         (window.lottoConfig && window.lottoConfig.lotteryNumericId)
+                                    || (window.lottoConfig && window.lottoConfig.gameId) || '');
     addHidden('main_numbers',        mainNums);
     addHidden('extra_ball_numbers',  extraNums || '');
     addHidden('source',              'mcmc_v2');
