@@ -205,7 +205,11 @@ if (!function_exists('mcmcSanitizeJson')) {
 if (!function_exists('mcmcComputeNormalizedEntropy')) {
     /**
      * Shannon entropy of main-ball frequency distribution, normalized to [0,1].
-     * window=0 uses all draws. Higher value = more uniform distribution.
+     * @param  array  $draws  2D array of draw sequences
+     * @param  int    $maxN   Maximum ball number
+     * @param  int    $pick   Pick size
+     * @param  int    $window Last N draws to consider. 0 = use all draws.
+     * Higher entropy value = more uniform distribution.
      */
     function mcmcComputeNormalizedEntropy(array $draws, $maxN, $pick, $window = 0) {
         if (empty($draws) || $maxN <= 0 || $pick <= 0) return 0.5;
@@ -927,14 +931,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken() && isset($_P
         ->where($db->quoteName('l.lottery_id') . '=' . $db->quote($lottery));
     $db->setQuery($q); $gameDbId = $db->loadResult();
     $nextDraw = getNextDrawDate($gameDbId, $db, $tableName);
+    /* ---------------------------------------------------------------
+       Schema-confirmed columns from #__user_saved_numbers.
+       Derived fields computed server-side to ensure canonical correctness.
+       Column names quoted with quoteName() per Joomla best practice (H-2).
+       --------------------------------------------------------------- */
+
+    /* prediction_family: 'regular' for standard lotteries, 'daily' for pick3/4/5.
+       $isDailyGame is defined in Section 16 (after this POST handler exits via redirect),
+       so we compute the same expression inline from $lc which IS available at this point. */
+    $predFamilyIsDaily = ((int)($lc['max_main_ball_number'] ?? 0) <= 9
+                          && empty($lc['has_extra_ball']));
+    $predFamily = $predFamilyIsDaily ? 'daily' : 'regular';
+
+    /* render_mode: determines front-end renderer */
+    $renderMode  = ($predFamily === 'daily') ? 'daily_combos' : 'regular_main_extra';
+
+    /* prediction_type: taken from lotteryConfig or defaulted from game_id */
+    $predType    = trim((string)($lc['prediction_type'] ?? $gameId));
+
+    /* draws_analyzed: posted by JS so user sees the count that was used */
+    $drawsAnalyzed = max(0, (int)($_POST['draws_analyzed'] ?? 0));
+
+    /* settings_json: store MCMC params as structured JSON for reproducibility */
+    $settingsArr = [
+        'source'     => 'mcmc_v2',
+        'walks'      => $W, 'burn_in' => $B, 'laplace_k' => $K,
+        'decay'      => $D, 'chain_len' => $CL,
+        'model_version' => MCMC_MODEL_VERSION,
+    ];
+    $settingsJson = $db->quote(mcmcSafeJsonEncode($settingsArr));
+
+    /* save_schema_version: version marker for structured display fields */
+    $saveSchemaVer = $db->quote('mcmc_v2');
+
+    /* Canonical target fields bound at save time */
+    $targetGameId     = $db->quote((string)($gameDbId ?? $gameId));
+    $targetLotteryId  = (int)$lottery;  /* already validated > 0 above */
+
     $ins = $db->getQuery(true)
         ->insert($db->quoteName('#__user_saved_numbers'))
-        ->columns(['user_id','lottery_id','main_numbers','extra_ball_numbers',
-                   'source','label','generated_at','date_saved','next_draw_date',
-                   'walks','burn_in','laplace_k','decay','chain_len'])
-        ->values((int)$currUser->id.','.$lottery.','.$mainNums.','.$extraNums.','
-                 .$src.','.$lbl.','.$genAt.','.$saved.','.$db->quote($nextDraw).','
-                 .$W.','.$B.','.$K.','.$D.','.$CL);
+        ->columns(array_map([$db,'quoteName'], [
+            'user_id', 'lottery_id', 'main_numbers', 'extra_ball_numbers',
+            'source', 'label', 'generated_at', 'date_saved', 'next_draw_date',
+            'walks', 'burn_in', 'laplace_k', 'decay', 'chain_len',
+            'draws_analyzed',
+            'prediction_family', 'prediction_type', 'render_mode',
+            'settings_json', 'save_schema_version',
+            'target_game_id', 'target_lottery_id',
+        ]))
+        ->values(implode(',', [
+            (int)$currUser->id,
+            $targetLotteryId,
+            $mainNums,
+            $extraNums,
+            $src,
+            $lbl,
+            $genAt,
+            $saved,
+            $db->quote($nextDraw),
+            $W, $B, $K, $D, $CL,
+            $drawsAnalyzed,
+            $db->quote($predFamily),
+            $db->quote($predType),
+            $db->quote($renderMode),
+            $settingsJson,
+            $saveSchemaVer,
+            $targetGameId,
+            $targetLotteryId,
+        ]));
     try {
         $db->setQuery($ins); $db->execute();
         $app->enqueueMessage('Prediction set saved successfully.');
@@ -2390,7 +2455,7 @@ function extractAllFeatures(draws, pick, maxN) {
  * @param  {Array}  draws   Draw history (2D)
  * @param  {number} maxN    Max ball number
  * @param  {number} pick    Pick size
- * @param  {number} window  Last N draws to consider (0=all)
+ * @param  {number} winSize  Last N draws to consider (0=all)
  * @return {number} Normalized entropy [0,1]
  */
 function computeNormEntropy(draws, maxN, pick, winSize) {
@@ -3191,8 +3256,12 @@ function renderCompareTable() {
 function toggleComparePanel() {
     var el = document.getElementById('mcmcComparePanel');
     if (!el) return;
-    if (el.style.display === 'none' || el.style.display === '') {
-        el.style.display = 'block'; /* Fix C-2: must override CSS display:none rule */
+    /* Use 'block' as the canonical shown state.
+       The initial CSS rule sets display:none so el.style.display starts as ''.
+       Checking !== 'block' correctly handles both the CSS-hidden initial state
+       and any subsequent hide (set to 'none'). */
+    if (el.style.display !== 'block') {
+        el.style.display = 'block';
         renderCompareTable();
     } else {
         el.style.display = 'none';
@@ -3606,6 +3675,8 @@ function runOptimizer() {
     var btCases     = inputInt('optBtCases',   50);
     var topN        = inputInt('topNInput',    20);
     var weights     = getCurrentEnsembleWeights();
+    /* Read chainLen once here to avoid repeated DOM queries inside processNextCandidate */
+    var optChainLen = inputInt('chainLenInput', 3000);
 
     btStart  = clamp(btStart, 20, draws.length - btCases - 1);
     btCases  = clamp(btCases, 5, 300);
@@ -3688,7 +3759,7 @@ function runOptimizer() {
         var buckets    = computeReliabilityBuckets(testPreds, testActuals, pick, maxN, 10);
         var ece        = computeECE(buckets, testPreds.length * maxN);
         var calibScore = Math.max(0, 1 - ece);
-        var cplx       = computeComplexityPenalty(cand.W, inputInt('chainLenInput', 3000));
+        var cplx       = computeComplexityPenalty(cand.W, optChainLen);
         var finalScore = computeFinalScore(avgScore, calibScore, stability, cplx);
 
         leaderboard.push({
@@ -3779,7 +3850,7 @@ function renderOptimizerResults(leaderboard, status) {
     var showCount = Math.min(20, leaderboard.length);
     for (var i = 0; i < showCount; i++) {
         var e  = leaderboard[i];
-        var cls = (i === 0) ? ' style="background:#0a2e17"' : '';
+        var cls = (i === 0) ? ' style="background:rgba(32,201,151,0.10)"' : ''; /* SKAI Success tint */
         lbHtml += '<tr' + cls + '>'
                 + '<td>' + (i + 1) + '</td>'
                 + '<td>' + escHtml(String(e.W)) + '</td>'
@@ -3795,6 +3866,39 @@ function renderOptimizerResults(leaderboard, status) {
     }
     lbHtml += '</tbody></table>';
     setInner('optimizerLeaderboard', lbHtml);
+
+    /* C-1: Persist optimizer best result to server learning state DB */
+    if (status === 'completed' && leaderboard.length > 0) {
+        var bestOpt   = leaderboard[0];
+        var drawsOpt  = window.lottoDraws   || [];
+        var cfgOpt    = window.lottoConfig  || {};
+        var pickOpt   = cfgOpt.pickSize || 6;
+        var maxNOpt   = (cfgOpt.rangeMain && cfgOpt.rangeMain[1]) || 49;
+        var confSigOpt = {
+            calibration       : bestOpt.calibScore,
+            stability         : bestOpt.stability,
+            sampleSize        : bestOpt.cases,
+            drift             : (drawsOpt.length >= 50) ? computeFreqDrift(drawsOpt, maxNOpt, pickOpt, 50, 200) : 0,
+            entropyUniformity : computeNormEntropy(drawsOpt, maxNOpt, pickOpt, 0)
+        };
+        var confResOpt    = computeConfidenceScore(confSigOpt);
+        var bestPOpt      = {
+            W  : bestOpt.W,
+            K  : bestOpt.K,
+            D  : bestOpt.D,
+            B  : inputInt(  'burnInInput',   70),
+            CL : inputInt(  'chainLenInput', 3000)
+        };
+        var payOpt = buildPersistPayload('optimizer', {
+            logLoss    : bestOpt.logLoss,
+            brier      : bestOpt.brier,
+            hitRate    : null,
+            stability  : bestOpt.stability,
+            calibScore : bestOpt.calibScore,
+            confidence : confResOpt.score
+        }, getCurrentEnsembleWeights(), bestPOpt, bestOpt.cases, []);
+        persistLearningState('optimizer', payOpt);
+    }
 }
 
 /** Apply optimizer result params to form inputs */
@@ -4071,11 +4175,11 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
         }
     }
 
-    addHidden('save_set',           '1');
-    /* Note: lottery_id must be the numeric DB lottery_id, NOT the string game_id.
-       The server-side save handler casts this to int and validates it exists.
-       window.lottoConfig.lotteryNumericId should be set server-side if different
-       from gameId. Fallback to gameId only if no numeric ID is available. */
+    addHidden('save_set',       '1');
+    /* lottery_id: must be the numeric DB lottery_id from #__lotteries.lottery_id.
+       window.lottoConfig.lotteryNumericId is injected by PHP at page render time.
+       Fallback to gameId only if lotteryNumericId was not resolved (M-2 guard
+       below will block the submit if the value is 0 or missing). */
     addHidden('lottery_id',         (window.lottoConfig && window.lottoConfig.lotteryNumericId)
                                     || (window.lottoConfig && window.lottoConfig.gameId) || '');
     addHidden('main_numbers',        mainNums);
@@ -4083,11 +4187,14 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
     addHidden('source',              'mcmc_v2');
     addHidden('label',               label || '');
     addHidden('generated_at',        generatedAt || new Date().toISOString());
-    addHidden('walks',               walks   || 2700);
-    addHidden('burn_in',             burnIn  || 70);
-    addHidden('laplace_k',           laplaceK|| 1.0);
-    addHidden('decay',               decay   || 0.02);
-    addHidden('chain_len',           chainLen|| 3000);
+    addHidden('walks',               walks    || 2700);
+    addHidden('burn_in',             burnIn   || 70);
+    addHidden('laplace_k',           laplaceK || 1.0);
+    addHidden('decay',               decay    || 0.02);
+    addHidden('chain_len',           chainLen || 3000);
+    /* Schema-confirmed columns: draws_analyzed tells the server how many draws
+       were loaded at prediction time, stored in #__user_saved_numbers.draws_analyzed */
+    addHidden('draws_analyzed',      String((window.lottoDraws || []).length));
 
     /* M-2: Guard against zero/missing lotteryNumericId before submitting */
     var lottNumId = (window.lottoConfig && window.lottoConfig.lotteryNumericId) || 0;
