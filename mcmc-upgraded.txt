@@ -726,7 +726,7 @@ if (!function_exists('mcmcGetMigrationSQL')) {
 {
     $input2  = JFactory::getApplication()->input;
     $action2 = $input2->getString('action', '');
-    if ($action2 === 'mcmc_migrate' && JSession::checkToken()) {
+    if ($action2 === 'mcmc_migrate' && $_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken()) {
         $currUser2 = JFactory::getUser();
         if ($currUser2->authorise('core.admin')) {
             $sqlList = mcmcGetMigrationSQL();
@@ -758,11 +758,19 @@ if (!function_exists('mcmcGetMigrationSQL')) {
 {
     $inputLs = JFactory::getApplication()->input;
     $actionLs = $inputLs->getString('action', '');
-    if ($actionLs === 'mcmc_save_learning' && JSession::checkToken()) {
+    if ($actionLs === 'mcmc_save_learning' && $_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken()) {
         $currUserLs = JFactory::getUser();
         if (!$currUserLs->guest) {
             header('Content-Type: application/json; charset=utf-8');
-            $rawBody     = file_get_contents('php://input');
+            /* Read JSON body: try Joomla JInput first (stream-safe in Joomla 5.x),
+               fall back to direct php://input read if JInput returns nothing. */
+            $rawBody = '';
+            try {
+                $rawBody = (string)(JFactory::getApplication()->input->json->getRaw());
+            } catch (\Exception $_e) { $rawBody = ''; }
+            if ($rawBody === '') {
+                $rawBody = (string)@file_get_contents('php://input');
+            }
             $payload     = mcmcSafeJsonDecode($rawBody, null);
             if ($payload === null) {
                 echo json_encode(['ok' => false, 'error' => 'Invalid JSON payload']);
@@ -869,12 +877,15 @@ if ($gameId === '') {
     else { die('No lotteries defined.'); }
 }
 
-echo "<!-- DEBUG requestedId: "   . htmlspecialchars($requestedId === '' ? 'NULL/empty' : $requestedId, ENT_QUOTES, 'UTF-8') . " -->";
-echo "<!-- DEBUG resolved gameId: " . htmlspecialchars($gameId, ENT_QUOTES, 'UTF-8') . " -->";
-echo "<!-- DEBUG available keys: "  . htmlspecialchars(implode(', ', $allKeys), ENT_QUOTES, 'UTF-8') . " -->";
-
+if (defined('JDEBUG') && JDEBUG) {
+    echo "<!-- DEBUG requestedId: "   . htmlspecialchars($requestedId === '' ? 'NULL/empty' : $requestedId, ENT_QUOTES, 'UTF-8') . " -->";
+    echo "<!-- DEBUG resolved gameId: " . htmlspecialchars($gameId, ENT_QUOTES, 'UTF-8') . " -->";
+    echo "<!-- DEBUG available keys: "  . htmlspecialchars(implode(', ', $allKeys), ENT_QUOTES, 'UTF-8') . " -->";
+}
 $gameIdDb = resolveGameIdDb($db, $gameId);
-echo "<!-- DEBUG gameIdDb: " . htmlspecialchars($gameIdDb, ENT_QUOTES, 'UTF-8') . " -->";
+if (defined('JDEBUG') && JDEBUG) {
+    echo "<!-- DEBUG gameIdDb: " . htmlspecialchars($gameIdDb, ENT_QUOTES, 'UTF-8') . " -->";
+}
 
 if (!isset($lotteries[$gameId])) {
     echo '[[div class="mcmc-container"]][[h2]]Select a Lottery[[/h2]][[ul]]';
@@ -989,7 +1000,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken() && isset($_P
             $lbl,
             $genAt,
             $saved,
-            $db->quote($nextDraw),
+            ($nextDraw !== '' ? $db->quote($nextDraw) : 'NULL'),
             $W, $B, $K, $D, $CL,
             $drawsAnalyzed,
             $db->quote($predFamily),
@@ -1131,7 +1142,7 @@ echo '[[/script]]';
 [[head]]
 [[meta charset="UTF-8"]]
 [[meta name="viewport" content="width=device-width, initial-scale=1.0"]]
-[[title]]MCMC Lottery Forecasting[[/title]]
+[[title]]<?php echo htmlspecialchars(($spec['lotteryName'] ?? 'MCMC Lottery'), ENT_QUOTES, 'UTF-8'); ?> - MCMC Prediction[[/title]]
 [[script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"]][[/script]]
 [[style]]
 /* ============================================================
@@ -1155,7 +1166,7 @@ echo '[[/script]]';
 
    WCAG AA notes:
      Text on Deep Navy (#0A1A33): use #EFEFF5 (primary) or #A8BFDA (secondary).
-     #20C997 on #0A1A33: contrast ~3.8 -- use for large/bold text only.
+     #20C997 on #0A1A33: contrast ~8.2:1 -- passes AA for all text.
      #F5A623 on #0A1A33: contrast ~6.2 -- passes AA for all text.
      #1C66FF on #0A1A33: contrast ~3.0 -- use only for interactive elements.
      For button text on #1C66FF bg: use #FFFFFF (contrast ~4.2, AA large text).
@@ -1562,6 +1573,12 @@ a:hover { text-decoration: underline; color: #A8C8FF; }
 [[body]]
 [[div class="mcmc-container"]]
 
+<!-- Page header: lottery name (filled by JS from window.lottoConfig.lotteryName) -->
+[[div class="mcmc-card" style="background:linear-gradient(135deg,#0A1A33 0%,#1C66FF 100%);margin-bottom:16px;"]]
+  [[h1 id="lotteryTitle" style="font-size:22px;font-weight:700;color:#EFEFF5;margin:0 0 4px;"]]Loading...[[/h1]]
+  [[div id="lotteryDetails" style="font-size:13px;color:#7F8DAA;"]]Loading configuration...[[/div]]
+[[/div]]
+
 <!-- ==================================================================
      NEW SECTION: RECOMMENDATION PANEL (Deliverable 3 UI, Layer 4)
      Insertion point: top of page, before existing advanced settings.
@@ -1611,7 +1628,7 @@ a:hover { text-decoration: underline; color: #A8C8FF; }
     [[/div]]
     <!-- Ensemble weight display -->
     [[div style="margin-top:10px;"]]
-      [[div style="font-size:12px;color:#6e7681;margin-bottom:6px;"]]Ensemble Component Weights[[/div]]
+      [[div style="font-size:12px;color:#7F8DAA;margin-bottom:6px;"]]Ensemble Component Weights[[/div]]
       [[div id="ensembleWeightBars"]][[/div]]
     [[/div]]
   [[/div]]
@@ -1686,7 +1703,7 @@ a:hover { text-decoration: underline; color: #A8C8FF; }
 
   <!-- NEW: Ensemble weight controls -->
   [[div style="margin-top:12px;"]]
-    [[div style="font-size:13px;font-weight:600;color:#e6edf3;margin-bottom:8px;"]]Ensemble Component Weights[[/div]]
+    [[div style="font-size:13px;font-weight:600;color:#EFEFF5;margin-bottom:8px;"]]Ensemble Component Weights[[/div]]
     [[div class="form-row"]]
       [[div class="form-group"]]
         [[label for="wLag1Input"]]Lag-1 Transition Weight[[/label]]
@@ -1705,7 +1722,7 @@ a:hover { text-decoration: underline; color: #A8C8FF; }
 
   <!-- NEW: Reranker controls -->
   [[div style="margin-top:12px;"]]
-    [[div style="font-size:13px;font-weight:600;color:#e6edf3;margin-bottom:8px;"]]Feature Reranker[[/div]]
+    [[div style="font-size:13px;font-weight:600;color:#EFEFF5;margin-bottom:8px;"]]Feature Reranker[[/div]]
     [[div class="form-row"]]
       [[div class="form-group"]]
         [[label for="useRerankerInput"]]Enable Reranker[[/label]]
@@ -1776,7 +1793,7 @@ a:hover { text-decoration: underline; color: #A8C8FF; }
   [[button class="mcmc-btn mcmc-btn-danger" id="btCancelBtn" onclick="cancelBacktest()" style="display:none"]]Cancel[[/button]]
   [[div id="btProgress" style="margin-top:8px;display:none;"]]
     [[div class="mcmc-progress-wrap"]][[div class="mcmc-progress-bar pb-blue" id="btProgressBar" style="width:0%"]][[/div]][[/div]]
-    [[div id="btProgressText" style="font-size:12px;color:#8b949e;margin-top:4px;"]]Initializing...[[/div]]
+    [[div id="btProgressText" style="font-size:12px;color:#7F8DAA;margin-top:4px;"]]Initializing...[[/div]]
   [[/div]]
   [[div id="backtestResultsV2"]][[/div]]
 [[/div]]
@@ -1815,7 +1832,7 @@ a:hover { text-decoration: underline; color: #A8C8FF; }
   [[button class="mcmc-btn mcmc-btn-danger" id="optCancelBtn" onclick="cancelOptimizer()" style="display:none"]]Cancel[[/button]]
   [[div id="optProgress" style="margin-top:8px;display:none;"]]
     [[div class="mcmc-progress-wrap"]][[div class="mcmc-progress-bar pb-blue" id="optProgressBar" style="width:0%"]][[/div]][[/div]]
-    [[div id="optProgressText" style="font-size:12px;color:#8b949e;margin-top:4px;"]]Initializing...[[/div]]
+    [[div id="optProgressText" style="font-size:12px;color:#7F8DAA;margin-top:4px;"]]Initializing...[[/div]]
   [[/div]]
   [[div id="optimizerResults"]][[/div]]
   [[div id="optimizerLeaderboard"]][[/div]]
@@ -2296,7 +2313,7 @@ function runEnsemblePrediction(drawsSlice, pick, maxN, params, calibMap) {
     var blended = blendEnsemble(probsA, probsB, probsC, wts);
 
     /* Optionally apply calibration map (piecewise monotonic remapping) */
-    if (calibMap && window.mcmcCalibrationEnabled !== false) {
+    if (calibMap && (document.getElementById('useCalibInput') ? document.getElementById('useCalibInput').value !== '0' : true)) {
         blended = applyCalibrationMap(blended, calibMap);
     }
 
@@ -3173,9 +3190,9 @@ function updateHealthCard(rec, ls) {
     var sample   = ls.sampleSize || 0;
     var calGrade = rec.calibration_grade || 'N/A';
 
-    /* Color-code the values */
-    var confColor = (rec.confidence >= 0.75) ? '#56d364' : ((rec.confidence >= 0.50) ? '#d29922' : '#f85149');
-    var stabColor = (rec.stability  >= 0.50) ? '#56d364' : '#f85149';
+    /* Color-code the values -- SKAI palette */
+    var confColor = (rec.confidence >= 0.75) ? '#20C997' : ((rec.confidence >= 0.50) ? '#F5A623' : '#FF6B6B');
+    var stabColor = (rec.stability  >= 0.50) ? '#20C997' : '#FF6B6B';
 
     setInner('healthConfVal',   '<span style="color:' + confColor + '">' + confPct + '%</span>');
     setInner('healthConfLabel', rec.confidence_label || 'none');
@@ -3556,7 +3573,7 @@ function renderBacktestResults(results, predVecs, actualVecs, pick, maxN, topN, 
 
     /* Build summary HTML */
     var html = '<div class="bt-summary-box">'
-             + '<div style="font-size:14px;font-weight:700;color:#e6edf3;margin-bottom:10px;">'
+             + '<div style="font-size:14px;font-weight:700;color:#EFEFF5;margin-bottom:10px;">'
              + 'Backtest Summary &mdash; ' + n + ' cases' + trendIcon
              + '</div>'
              + '<div class="bt-summary-grid">'
@@ -3614,7 +3631,7 @@ function renderBacktestResults(results, predVecs, actualVecs, pick, maxN, topN, 
     }
 
     /* Results table (last 20 cases) */
-    html += '<div style="margin-top:10px;font-size:13px;font-weight:600;color:#8b949e;">Last ' + Math.min(20, n) + ' cases:</div>';
+    html += '<div style="margin-top:10px;font-size:13px;font-weight:600;color:#7F8DAA;">Last ' + Math.min(20, n) + ' cases:</div>';
     html += '<table class="mcmc-table"><thead><tr><th>Case#</th><th>Score</th><th>Hits</th><th>Actual</th><th>Top-3 Picks</th></tr></thead><tbody>';
     var showFrom = Math.max(0, n - 20);
     for (var r = showFrom; r < n; r++) {
@@ -3997,11 +4014,11 @@ function runPrediction() {
                   + buildBadge('Confidence: ' + conf.label + ' (' + fmt(conf.score, 2) + ')', 'mcmc-badge badge-' + conf.label)
                   + '&nbsp;'
                   + buildBadge(sharpness > 0.3 ? 'Sharp distribution' : 'Flat distribution', 'mcmc-badge badge-' + (sharpness > 0.3 ? 'stable' : 'medium'))
-                  + '<div style="font-size:11px;color:#8b949e;margin-top:4px;">' + escHtml(conf.explanation) + '</div>'
+                  + '<div style="font-size:11px;color:#7F8DAA;margin-top:4px;">' + escHtml(conf.explanation) + '</div>'
                   + '</div>';
 
             /* Main balls display */
-            html += '<div style="font-size:13px;color:#8b949e;margin-bottom:6px;">Main Balls (top-' + topN + '):</div>';
+            html += '<div style="font-size:13px;color:#7F8DAA;margin-bottom:6px;">Main Balls (top-' + topN + '):</div>';
             html += '<div class="numbers-display">';
             for (var t = 0; t < topPicks.length; t++) {
                 var prob = blended[topPicks[t] - 1];
@@ -4012,7 +4029,7 @@ function runPrediction() {
 
             /* Extra balls display */
             if (extraPicks.length) {
-                html += '<div style="font-size:13px;color:#8b949e;margin:10px 0 6px;">Extra Balls:</div>';
+                html += '<div style="font-size:13px;color:#7F8DAA;margin:10px 0 6px;">Extra Balls:</div>';
                 html += '<div class="numbers-display">';
                 for (var ep = 0; ep < extraPicks.length; ep++) {
                     html += '<div class="number-ball ball-extra ball-predicted">' + escHtml(String(extraPicks[ep])) + '</div>';
@@ -4021,7 +4038,7 @@ function runPrediction() {
             }
 
             /* Analysis summary */
-            html += '<div style="margin-top:10px;font-size:12px;color:#8b949e;">'
+            html += '<div style="margin-top:10px;font-size:12px;color:#7F8DAA;">'
                   + 'Regime: ' + buildBadge(buildRegimeKey(draws, lottoConfig), 'mcmc-badge badge-regime')
                   + ' | Entropy: ' + fmt(entropy, 3)
                   + ' | Sharpness: ' + fmt(sharpness, 3)
@@ -4072,18 +4089,18 @@ function renderDiagnostics() {
                 datasets: [{
                     label: 'Decayed Frequency',
                     data: freqProbs,
-                    backgroundColor: 'rgba(31,111,235,0.6)',
-                    borderColor: 'rgba(56,139,253,1)',
+                    backgroundColor: 'rgba(28,102,255,0.55)',
+                    borderColor: '#1C66FF',
                     borderWidth: 1
                 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { labels: { color: '#8b949e' } } },
+                plugins: { legend: { labels: { color: '#7F8DAA' } } },
                 scales: {
-                    x: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#21262d' } },
-                    y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } }
+                    x: { ticks: { color: '#7F8DAA', font: { size: 10 } }, grid: { color: 'rgba(28,102,255,0.12)' } },
+                    y: { ticks: { color: '#7F8DAA' }, grid: { color: 'rgba(28,102,255,0.12)' } }
                 }
             }
         });
@@ -4108,18 +4125,18 @@ function renderDiagnostics() {
                 datasets: [{
                     label: 'Lag-1 Transition Probability (Top 10)',
                     data: top10data,
-                    backgroundColor: 'rgba(88,166,255,0.6)',
-                    borderColor: 'rgba(88,166,255,1)',
+                    backgroundColor: 'rgba(122,173,255,0.55)',
+                    borderColor: '#7AADFF',
                     borderWidth: 1
                 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { labels: { color: '#8b949e' } } },
+                plugins: { legend: { labels: { color: '#7F8DAA' } } },
                 scales: {
-                    x: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
-                    y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } }
+                    x: { ticks: { color: '#7F8DAA' }, grid: { color: 'rgba(28,102,255,0.12)' } },
+                    y: { ticks: { color: '#7F8DAA' }, grid: { color: 'rgba(28,102,255,0.12)' } }
                 }
             }
         });
@@ -4131,8 +4148,8 @@ function renderDiagnostics() {
     var regime  = buildRegimeKey(draws, lottoConfig);
     var ls      = window.mcmcLearningState || {};
 
-    var diagHtml = '<div style="font-size:12px;line-height:1.8;color:#8b949e;margin-top:8px;">'
-                 + '<strong style="color:#e6edf3;">Diagnostic Summary</strong><br>'
+    var diagHtml = '<div style="font-size:12px;line-height:1.8;color:#7F8DAA;margin-top:8px;">'
+                 + '<strong style="color:#EFEFF5;">Diagnostic Summary</strong><br>'
                  + 'Draws loaded: '         + draws.length + '<br>'
                  + 'Max ball number: '      + maxN + '<br>'
                  + 'Pick size: '            + pick + '<br>'
@@ -4211,6 +4228,36 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
    ============================================================ */
 
 document.addEventListener('DOMContentLoaded', function () {
+    /* Populate lottery name heading and details from window.lottoConfig */
+    var cfg         = window.lottoConfig   || {};
+    var draws       = window.lottoDraws    || [];
+    var lotteryName = String(cfg.lotteryName || 'MCMC Lottery');
+    var pickSize    = cfg.pickSize || 0;
+    var maxMain     = (cfg.rangeMain && cfg.rangeMain[1]) || 0;
+    var hasExtra    = cfg.hasExtra || false;
+    var extraCount  = cfg.extraCount || 0;
+    var maxExtra    = (cfg.rangeExtra && cfg.rangeExtra[1]) || 0;
+    var totalDraws  = draws.length;
+
+    /* Set page title */
+    document.title = (lotteryName ? lotteryName : 'MCMC Lottery') + ' - MCMC Prediction';
+
+    /* Fill lottery name heading */
+    var hTitle = document.getElementById('lotteryTitle');
+    if (hTitle) { hTitle.textContent = lotteryName; }
+
+    /* Fill lottery details */
+    var detEl = document.getElementById('lotteryDetails');
+    if (detEl) {
+        var det = 'Pick ' + pickSize + ' from 1-' + maxMain
+                + (hasExtra ? (' | Bonus: ' + extraCount + ' from 1-' + maxExtra) : '')
+                + ' | ' + totalDraws + ' historical draws loaded';
+        if (!maxMain || totalDraws === 0) {
+            det = 'Invalid configuration or no historical draws found.';
+        }
+        detEl.textContent = det;
+    }
+
     /* Render recommendation panel from PHP-injected data */
     if (window.mcmcRecommendation) {
         renderRecommendPanel();
@@ -4237,7 +4284,7 @@ document.addEventListener('DOMContentLoaded', function () {
     /* Initial audit entry */
     auditLog('regime_change', {
         regime    : (ls.regimeKey || 'unknown'),
-        draws     : (window.lottoDraws || []).length,
+        draws     : totalDraws,
         source    : (ls.source || 'default')
     });
 });
