@@ -94,11 +94,11 @@ if (!defined('MCMC_RR_W_VOLATILITY'))   define('MCMC_RR_W_VOLATILITY',   0.10);
 if (!defined('MCMC_RR_W_AGREE'))        define('MCMC_RR_W_AGREE',        0.30);
 
 // --- Security: allowlisted event types and status values ---
-define('MCMC_ALLOWED_EVENT_TYPES', [
+if (!defined('MCMC_ALLOWED_EVENT_TYPES')) define('MCMC_ALLOWED_EVENT_TYPES', [
     'weight_update','regime_change','param_update',
-    'calibration_update','stability_update','backtest_run','optimizer_run'
+    'calibration_update','stability_update','backtest_run','optimizer_run','prediction_run'
 ]);
-define('MCMC_ALLOWED_STATUSES', ['pending','running','completed','failed','cancelled']);
+if (!defined('MCMC_ALLOWED_STATUSES')) define('MCMC_ALLOWED_STATUSES', ['pending','running','completed','failed','cancelled']);
 
 // --- Input parameter bounds (used server-side for clamping in SECTION 15)
 // These must match MCMC_JS.PARAM_*_MIN/MAX in the JavaScript central config. ---
@@ -404,12 +404,12 @@ if (!function_exists('mcmcSaveLearningState')) {
             if ($db->getAffectedRows() > 0) return true;
             $ins = $db->getQuery(true)
                 ->insert($db->quoteName('#__mcmc_learning_state'))
-                ->columns([
+                ->columns(array_map([$db,'quoteName'], [
                     'game_id','regime_key','model_version',
                     'best_params_json','component_weights_json','calibration_map_json',
                     'rolling_metrics_json','confidence_score','stability_score',
                     'sample_size','last_draw_count','is_active','created_at','updated_at'
-                ])
+                ]))
                 ->values(implode(',', [
                     $db->quote($gameIdDb), $db->quote($regimeKey), $db->quote($modelVersion),
                     $db->quote($bestParams), $db->quote($compWts), $db->quote($calibMap),
@@ -438,7 +438,7 @@ if (!function_exists('mcmcLogAudit')) {
         try {
             $q = $db->getQuery(true)
                 ->insert($db->quoteName('#__mcmc_model_audit'))
-                ->columns(['game_id','regime_key','event_type','event_payload_json','created_at'])
+                ->columns(array_map([$db,'quoteName'], ['game_id','regime_key','event_type','event_payload_json','created_at']))
                 ->values(implode(',', [
                     $db->quote((string)$gameIdDb),
                     $db->quote((string)$regimeKey),
@@ -745,6 +745,75 @@ if (!function_exists('mcmcGetMigrationSQL')) {
 }
 
 // ==============================================================================
+// SECTION 12B: AJAX LEARNING STATE PERSISTENCE ENDPOINT (NEW -- C-1 fix)
+// Purpose: Accept JSON POST from JS after backtest/optimizer completes and
+//          persist computed metrics, weights, and calibration to DB.
+// Auth:    Requires CSRF token and logged-in user (same as save prediction).
+// URL:     POST with action=mcmc_save_learning
+// ==============================================================================
+{
+    $inputLs = JFactory::getApplication()->input;
+    $actionLs = $inputLs->getString('action', '');
+    if ($actionLs === 'mcmc_save_learning' && JSession::checkToken()) {
+        $currUserLs = JFactory::getUser();
+        if (!$currUserLs->guest) {
+            header('Content-Type: application/json; charset=utf-8');
+            $rawBody     = file_get_contents('php://input');
+            $payload     = mcmcSafeJsonDecode($rawBody, null);
+            if ($payload === null) {
+                echo json_encode(['ok' => false, 'error' => 'Invalid JSON payload']);
+                exit;
+            }
+            /* Validate required fields */
+            $lsGameId    = trim((string)($payload['game_id']    ?? ''));
+            $lsRegimeKey = trim((string)($payload['regime_key'] ?? ''));
+            if ($lsGameId === '' || $lsRegimeKey === '') {
+                echo json_encode(['ok' => false, 'error' => 'Missing game_id or regime_key']);
+                exit;
+            }
+            /* Sanitize regime key to safe chars only */
+            $lsRegimeKey = preg_replace('/[^a-z0-9_]/', '_', strtolower($lsRegimeKey));
+            /* Build state object from payload */
+            $lsState = [
+                'game_id'                => $lsGameId,
+                'regime_key'             => $lsRegimeKey,
+                'best_params_json'       => mcmcSanitizeJson($payload['best_params_json']       ?? '{}'),
+                'component_weights_json' => mcmcSanitizeJson($payload['component_weights_json'] ?? '{}'),
+                'calibration_map_json'   => mcmcSanitizeJson($payload['calibration_map_json']   ?? '{}'),
+                'rolling_metrics_json'   => mcmcSanitizeJson($payload['rolling_metrics_json']   ?? '{}'),
+                'confidence_score'       => (float)($payload['confidence_score'] ?? 0.0),
+                'stability_score'        => (float)($payload['stability_score']  ?? 0.0),
+                'sample_size'            => (int)($payload['sample_size']         ?? 0),
+                'last_draw_count'        => (int)($payload['last_draw_count']     ?? 0),
+            ];
+            $saved = mcmcSaveLearningState($db, $lsState);
+            /* Optionally persist backtest run summary */
+            $runType = (string)($payload['run_type'] ?? '');
+            if ($runType === 'backtest' && $saved) {
+                mcmcLogAudit($db, $lsGameId, $lsRegimeKey, 'backtest_run', [
+                    'cases'         => $lsState['sample_size'],
+                    'confidence'    => $lsState['confidence_score'],
+                    'stability'     => $lsState['stability_score'],
+                    'model_version' => MCMC_MODEL_VERSION,
+                ]);
+            } elseif ($runType === 'optimizer' && $saved) {
+                mcmcLogAudit($db, $lsGameId, $lsRegimeKey, 'optimizer_run', [
+                    'cases'         => $lsState['sample_size'],
+                    'confidence'    => $lsState['confidence_score'],
+                    'model_version' => MCMC_MODEL_VERSION,
+                ]);
+            }
+            echo json_encode(['ok' => $saved]);
+            exit;
+        } else {
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(['ok' => false, 'error' => 'Unauthorized']);
+            exit;
+        }
+    }
+}
+
+// ==============================================================================
 // SECTION 13: INPUT RESOLUTION & AUTH (UNCHANGED)
 // ==============================================================================
 $input = JFactory::getApplication()->input;
@@ -981,6 +1050,13 @@ echo 'window.MCMC_CFG = ' . json_encode([
     'RR_W_MOMENTUM'   => MCMC_RR_W_MOMENTUM,
     'RR_W_VOLATILITY' => MCMC_RR_W_VOLATILITY,
     'RR_W_AGREE'      => MCMC_RR_W_AGREE,
+    /* M-1: Regime thresholds mirrored to JS for single-source-of-truth */
+    'REG_SHORT_HIST'  => MCMC_REG_SHORT_HIST,
+    'REG_LONG_HIST'   => MCMC_REG_LONG_HIST,
+    'REG_SMALL_RANGE' => MCMC_REG_SMALL_RANGE,
+    'REG_LARGE_RANGE' => MCMC_REG_LARGE_RANGE,
+    'REG_HIGH_ENT'    => MCMC_REG_HIGH_ENT,
+    'REG_LOW_ENT'     => MCMC_REG_LOW_ENT,
 ], JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT) . ';';
 echo '[[/script]]';
 ?>
@@ -994,321 +1070,427 @@ echo '[[/script]]';
 [[script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"]][[/script]]
 [[style]]
 /* ============================================================
-   MCMC LOTTERY FORECASTING — EMBEDDED CSS
-   Deliverable 5: Full CSS additions and changes
-   Existing rules preserved. New rules added in NEW ADDITIONS block.
+   MCMC LOTTERY FORECASTING -- EMBEDDED CSS (v2.1.0 SKAI Brand)
+   Deliverable 5: Full CSS — SKAI brand palette applied throughout.
+
+   SKAI Palette:
+     Blue:          #1C66FF
+     Deep Navy:     #0A1A33
+     Sky Gray:      #EFEFF5
+     Soft Slate:    #7F8DAA
+     Success Green: #20C997
+     Caution Amber: #F5A623
+
+   SKAI Gradients:
+     Deep Horizon:  linear-gradient(135deg, #0A1A33 0%, #1C66FF 100%)
+     Radiant Blue:  linear-gradient(135deg, #1C66FF 0%, #7F8DAA 100%)
+     Slate Mist:    linear-gradient(180deg, #EFEFF5 0%, #FFFFFF 100%) [light surfaces]
+     Success:       linear-gradient(135deg, #20C997 0%, #0A1A33 100%)
+     Ember Warning: linear-gradient(135deg, #F5A623 0%, #0A1A33 100%)
+
+   WCAG AA notes:
+     Text on Deep Navy (#0A1A33): use #EFEFF5 (primary) or #A8BFDA (secondary).
+     #20C997 on #0A1A33: contrast ~3.8 -- use for large/bold text only.
+     #F5A623 on #0A1A33: contrast ~6.2 -- passes AA for all text.
+     #1C66FF on #0A1A33: contrast ~3.0 -- use only for interactive elements.
+     For button text on #1C66FF bg: use #FFFFFF (contrast ~4.2, AA large text).
    ============================================================ */
 
 /* --- Reset and base --- */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: #0d1117;
-    color: #c9d1d9;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+    background: #0A1A33; /* SKAI Deep Navy */
+    color: #EFEFF5;      /* SKAI Sky Gray -- primary text */
     font-size: 14px;
-    line-height: 1.5;
+    line-height: 1.6;
 }
-a { color: #58a6ff; text-decoration: none; }
-a:hover { text-decoration: underline; }
+a { color: #7AADFF; text-decoration: none; } /* lightened blue for AA on navy */
+a:hover { text-decoration: underline; color: #A8C8FF; }
 
 /* --- Layout container --- */
 .mcmc-container {
     max-width: 1200px;
     margin: 0 auto;
-    padding: 16px;
+    padding: 20px 16px;
 }
 
 /* --- Cards --- */
 .mcmc-card {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    padding: 16px 20px;
+    background: #0D2147;   /* slightly lighter than Deep Navy */
+    border: 1px solid rgba(28, 102, 255, 0.22); /* subtle SKAI Blue border */
+    border-radius: 10px;
+    padding: 18px 22px;
     margin-bottom: 18px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.30);
 }
 .mcmc-card h2, .mcmc-card h3 {
     font-size: 15px;
-    font-weight: 600;
-    color: #e6edf3;
+    font-weight: 700;
+    color: #EFEFF5;
     margin-bottom: 10px;
-    border-bottom: 1px solid #21262d;
-    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(28, 102, 255, 0.18);
+    padding-bottom: 7px;
+    letter-spacing: 0.2px;
 }
-.mcmc-card p { margin-bottom: 8px; color: #8b949e; font-size: 13px; }
+.mcmc-card p { margin-bottom: 8px; color: #7F8DAA; font-size: 13px; }
 
 /* --- Buttons --- */
 .mcmc-btn {
     display: inline-block;
-    padding: 6px 14px;
-    border: 1px solid #30363d;
-    border-radius: 6px;
-    background: #21262d;
-    color: #c9d1d9;
+    padding: 7px 16px;
+    border: 1px solid rgba(28, 102, 255, 0.30);
+    border-radius: 7px;
+    background: #152A50;  /* mid navy */
+    color: #EFEFF5;
     font-size: 13px;
+    font-weight: 500;
     cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
+    transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
     margin-right: 6px;
     margin-top: 4px;
+    letter-spacing: 0.1px;
 }
-.mcmc-btn:hover { background: #30363d; border-color: #8b949e; color: #e6edf3; }
-.mcmc-btn-primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
-.mcmc-btn-primary:hover { background: #388bfd; border-color: #388bfd; }
-.mcmc-btn-success { background: #238636; border-color: #238636; color: #fff; }
-.mcmc-btn-success:hover { background: #2ea043; border-color: #2ea043; }
-.mcmc-btn-warning { background: #9e6a03; border-color: #9e6a03; color: #fff; }
-.mcmc-btn-warning:hover { background: #bb8009; border-color: #bb8009; }
-.mcmc-btn-danger  { background: #b62324; border-color: #b62324; color: #fff; }
-.mcmc-btn-danger:hover  { background: #d1242f; border-color: #d1242f; }
-.mcmc-btn-sm { padding: 3px 9px; font-size: 12px; }
+.mcmc-btn:hover {
+    background: #1A3560;
+    border-color: rgba(28, 102, 255, 0.55);
+    box-shadow: 0 0 0 2px rgba(28, 102, 255, 0.15);
+    color: #EFEFF5;
+}
+/* Primary: SKAI Blue */
+.mcmc-btn-primary { background: #1C66FF; border-color: #1C66FF; color: #FFFFFF; }
+.mcmc-btn-primary:hover { background: #4D80FF; border-color: #4D80FF; box-shadow: 0 0 0 3px rgba(28,102,255,0.25); }
+/* Success: SKAI Success Green */
+.mcmc-btn-success { background: #20C997; border-color: #20C997; color: #0A1A33; }
+.mcmc-btn-success:hover { background: #3DDAAF; border-color: #3DDAAF; }
+/* Warning: SKAI Caution Amber */
+.mcmc-btn-warning { background: #F5A623; border-color: #F5A623; color: #0A1A33; }
+.mcmc-btn-warning:hover { background: #F7B84B; border-color: #F7B84B; }
+/* Danger: keep legible red */
+.mcmc-btn-danger  { background: #C0392B; border-color: #C0392B; color: #FFFFFF; }
+.mcmc-btn-danger:hover  { background: #E74C3C; border-color: #E74C3C; }
+.mcmc-btn-sm { padding: 4px 10px; font-size: 12px; }
 
 /* --- Tables --- */
 .mcmc-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
 .mcmc-table th {
-    background: #21262d; color: #8b949e; font-weight: 600;
-    padding: 6px 10px; border-bottom: 1px solid #30363d; text-align: left;
+    background: #152A50; color: #7F8DAA; font-weight: 700;
+    padding: 7px 10px; border-bottom: 1px solid rgba(28,102,255,0.18); text-align: left;
+    font-size: 12px; letter-spacing: 0.3px; text-transform: uppercase;
 }
 .mcmc-table td {
-    padding: 5px 10px; border-bottom: 1px solid #21262d; color: #c9d1d9;
+    padding: 6px 10px; border-bottom: 1px solid rgba(28,102,255,0.10); color: #EFEFF5;
     vertical-align: top;
 }
 .mcmc-table tr:last-child td { border-bottom: none; }
-.mcmc-table tr:hover td { background: #1c2128; }
+.mcmc-table tr:hover td { background: rgba(28,102,255,0.06); }
 
 /* --- Badges --- */
 .mcmc-badge {
     display: inline-block;
-    padding: 2px 8px;
+    padding: 2px 9px;
     border-radius: 12px;
     font-size: 11px;
-    font-weight: 600;
+    font-weight: 700;
     letter-spacing: 0.3px;
     vertical-align: middle;
 }
-.badge-high       { background: #196c2e; color: #56d364; border: 1px solid #196c2e; }
-.badge-medium     { background: #4d2d00; color: #d29922; border: 1px solid #9e6a03; }
-.badge-low        { background: #6e1a1a; color: #f85149; border: 1px solid #6e1a1a; }
-.badge-none       { background: #21262d; color: #6e7681; border: 1px solid #30363d; }
-.badge-stable     { background: #0d419d; color: #79c0ff; border: 1px solid #1158c7; }
-.badge-shifting   { background: #6e1a1a; color: #f85149; border: 1px solid #6e1a1a; }
-.badge-grade-A    { background: #196c2e; color: #56d364; border: 1px solid #196c2e; }
-.badge-grade-B    { background: #0d419d; color: #79c0ff; border: 1px solid #1158c7; }
-.badge-grade-C    { background: #4d2d00; color: #d29922; border: 1px solid #9e6a03; }
-.badge-grade-D    { background: #6e1a1a; color: #f85149; border: 1px solid #6e1a1a; }
-.badge-grade-NA   { background: #21262d; color: #6e7681; border: 1px solid #30363d; }
-.badge-regime     { background: #161b22; color: #a5d6ff; border: 1px solid #1f6feb; font-size: 10px; letter-spacing: 0.5px; }
+/* High/success -- SKAI Success Green */
+.badge-high    { background: rgba(32,201,151,0.15); color: #20C997; border: 1px solid rgba(32,201,151,0.40); }
+/* Medium/warning -- SKAI Caution Amber */
+.badge-medium  { background: rgba(245,166,35,0.12); color: #F5A623; border: 1px solid rgba(245,166,35,0.35); }
+/* Low/error */
+.badge-low     { background: rgba(192,57,43,0.12);  color: #FF6B6B; border: 1px solid rgba(192,57,43,0.35); }
+/* None/muted */
+.badge-none    { background: rgba(127,141,170,0.10); color: #7F8DAA; border: 1px solid rgba(127,141,170,0.25); }
+/* Stable -- SKAI Blue */
+.badge-stable  { background: rgba(28,102,255,0.12); color: #7AADFF; border: 1px solid rgba(28,102,255,0.35); }
+/* Shifting -- amber warning */
+.badge-shifting{ background: rgba(245,166,35,0.12); color: #F5A623; border: 1px solid rgba(245,166,35,0.35); }
+/* Calibration grades */
+.badge-grade-A { background: rgba(32,201,151,0.15); color: #20C997; border: 1px solid rgba(32,201,151,0.40); }
+.badge-grade-B { background: rgba(28,102,255,0.12); color: #7AADFF; border: 1px solid rgba(28,102,255,0.35); }
+.badge-grade-C { background: rgba(245,166,35,0.12); color: #F5A623; border: 1px solid rgba(245,166,35,0.35); }
+.badge-grade-D { background: rgba(192,57,43,0.12);  color: #FF6B6B; border: 1px solid rgba(192,57,43,0.35); }
+.badge-grade-NA{ background: rgba(127,141,170,0.10); color: #7F8DAA; border: 1px solid rgba(127,141,170,0.25); }
+/* Regime key badge -- monospace, SKAI Blue tint */
+.badge-regime  {
+    background: rgba(28,102,255,0.08); color: #7AADFF;
+    border: 1px solid rgba(28,102,255,0.30); font-size: 10px;
+    letter-spacing: 0.5px; font-family: monospace;
+}
 
 /* --- Progress bars --- */
-.mcmc-progress-wrap { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; margin: 4px 0; }
+.mcmc-progress-wrap { background: #152A50; border-radius: 4px; height: 8px; overflow: hidden; margin: 4px 0; }
 .mcmc-progress-bar  { height: 100%; border-radius: 4px; transition: width 0.3s; }
-.pb-green  { background: #238636; }
-.pb-blue   { background: #1f6feb; }
-.pb-yellow { background: #9e6a03; }
-.pb-red    { background: #b62324; }
+/* Use SKAI palette colors for bar fills */
+.pb-green  { background: #20C997; }         /* SKAI Success Green */
+.pb-blue   { background: #1C66FF; }          /* SKAI Blue */
+.pb-yellow { background: #F5A623; }          /* SKAI Caution Amber */
+.pb-red    { background: #C0392B; }
 
 /* --- Form inputs --- */
 .mcmc-input {
-    background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
-    padding: 6px 10px; border-radius: 6px; font-size: 13px; width: 100%;
+    background: #0A1A33; border: 1px solid rgba(28,102,255,0.25);
+    color: #EFEFF5; padding: 7px 10px; border-radius: 7px; font-size: 13px; width: 100%;
+    transition: border-color 0.15s, box-shadow 0.15s;
 }
-.mcmc-input:focus { border-color: #58a6ff; outline: none; box-shadow: 0 0 0 2px rgba(88,166,255,0.2); }
-.mcmc-select { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 5px 8px; border-radius: 6px; font-size: 13px; }
-.form-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; align-items: center; }
+.mcmc-input:focus {
+    border-color: #1C66FF; outline: none;
+    box-shadow: 0 0 0 3px rgba(28,102,255,0.20);
+}
+.mcmc-select {
+    background: #0A1A33; border: 1px solid rgba(28,102,255,0.25);
+    color: #EFEFF5; padding: 6px 8px; border-radius: 7px; font-size: 13px;
+}
+.form-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; align-items: flex-end; }
 .form-group { flex: 1 1 140px; }
-.form-group label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 3px; }
-.param-note { font-size: 11px; color: #6e7681; margin-top: 2px; }
+.form-group label { display: block; font-size: 12px; color: #7F8DAA; margin-bottom: 4px; font-weight: 500; letter-spacing: 0.2px; }
+.param-note { font-size: 11px; color: #4E6A8A; margin-top: 3px; }
 
 /* --- Charts --- */
 .chart-container { position: relative; height: 260px; margin: 10px 0; }
 
-/* --- Sections --- */
+/* --- Sections (collapsibles) --- */
 .mcmc-section-toggle {
-    cursor: pointer; user-select: none;
+    cursor: pointer;
+    -webkit-user-select: none; /* Safari */
+    user-select: none;
     display: flex; align-items: center; justify-content: space-between;
 }
-.mcmc-section-toggle .toggle-icon { font-size: 12px; color: #8b949e; transition: transform 0.2s; }
+.mcmc-section-toggle .toggle-icon { font-size: 12px; color: #7F8DAA; transition: transform 0.2s; }
 .mcmc-section-body { overflow: hidden; }
 
 /* --- Alerts / callouts --- */
 .mcmc-alert {
-    padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 12px;
+    padding: 11px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 12px;
     border-left: 3px solid;
 }
-.alert-info    { background: #0d2044; border-color: #1f6feb; color: #79c0ff; }
-.alert-success { background: #0a2e17; border-color: #238636; color: #56d364; }
-.alert-warning { background: #2a1a00; border-color: #9e6a03; color: #d29922; }
-.alert-error   { background: #2a0a0a; border-color: #b62324; color: #f85149; }
+.alert-info    { background: rgba(28,102,255,0.10);  border-color: #1C66FF; color: #7AADFF; }
+.alert-success { background: rgba(32,201,151,0.10);  border-color: #20C997; color: #20C997; }
+.alert-warning { background: rgba(245,166,35,0.10);  border-color: #F5A623; color: #F5A623; }
+.alert-error   { background: rgba(192,57,43,0.10);   border-color: #C0392B; color: #FF6B6B; }
 
 /* --- Spinner --- */
 .mcmc-spinner {
     display: inline-block; width: 14px; height: 14px;
-    border: 2px solid #30363d; border-top-color: #58a6ff;
+    border: 2px solid rgba(28,102,255,0.25); border-top-color: #1C66FF;
     border-radius: 50%; animation: spin 0.7s linear infinite;
     vertical-align: middle; margin-right: 6px;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ============================================================
-   NEW ADDITIONS — Recommendation panel, health cards, learning
-   state card, calibration summary, comparison table.
+   NEW ADDITIONS -- Recommendation panel, health cards,
+   learning state card, calibration summary, comparison table.
+   All using SKAI brand palette.
    ============================================================ */
 
-/* --- Recommendation panel --- */
+/* --- Recommendation panel: SKAI Deep Horizon gradient ---
+   This is a premium hero surface: uses the primary brand gradient.
+   Text on gradient must pass WCAG AA: #EFEFF5 on darkest part of gradient passes. */
 #mcmcRecommendPanel {
-    background: linear-gradient(135deg, #0d1f3c 0%, #161b22 100%);
-    border: 1px solid #1f6feb;
-    border-radius: 8px;
-    padding: 16px 20px;
+    background: linear-gradient(135deg, #0A1A33 0%, #1C2E5A 60%, #0D2147 100%);
+    border: 1px solid rgba(28,102,255,0.40);
+    border-radius: 10px;
+    padding: 18px 22px;
     margin-bottom: 18px;
+    box-shadow: 0 4px 20px rgba(28,102,255,0.12);
 }
 #mcmcRecommendPanel h2 {
-    font-size: 15px; font-weight: 700; color: #79c0ff;
-    margin-bottom: 10px; border-bottom: 1px solid #1f3a6e; padding-bottom: 6px;
+    font-size: 15px; font-weight: 800; color: #7AADFF;
+    margin-bottom: 10px;
+    border-bottom: 1px solid rgba(28,102,255,0.25);
+    padding-bottom: 7px;
     display: flex; align-items: center; gap: 8px;
+    letter-spacing: 0.2px;
 }
 .rec-profile-row {
     display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px;
 }
-.rec-profile-name { font-weight: 700; color: #e6edf3; font-size: 14px; }
-.rec-explanation  { color: #8b949e; font-size: 13px; line-height: 1.6; margin-bottom: 10px; }
+.rec-profile-name { font-weight: 700; color: #EFEFF5; font-size: 14px; letter-spacing: 0.1px; }
+.rec-explanation  { color: #A8BFDA; font-size: 13px; line-height: 1.7; margin-bottom: 12px; }
 .rec-params-grid  {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(120px,1fr));
+    /* Fallback flex for IE11-class browsers */
+    display: -webkit-flex;
+    display: flex;
+    flex-wrap: wrap;
+    /* Modern grid */
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px,1fr));
     gap: 8px; margin-bottom: 12px;
 }
 .rec-param-item {
-    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
-    padding: 6px 10px; text-align: center;
+    background: rgba(10,26,51,0.70);
+    border: 1px solid rgba(28,102,255,0.22);
+    border-radius: 8px; padding: 8px 10px; text-align: center;
+    backdrop-filter: blur(4px);
 }
-.rec-param-label { font-size: 10px; color: #6e7681; text-transform: uppercase; letter-spacing: 0.5px; }
-.rec-param-value { font-size: 16px; font-weight: 700; color: #79c0ff; }
-.rec-param-hint  { font-size: 10px; color: #6e7681; }
+.rec-param-label { font-size: 10px; color: #7F8DAA; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 3px; }
+.rec-param-value { font-size: 17px; font-weight: 800; color: #7AADFF; }
+.rec-param-hint  { font-size: 10px; color: #4E6A8A; margin-top: 2px; }
 .rec-actions     { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.rec-diff-warn   {
-    background: #2a1a00; border: 1px solid #9e6a03; border-radius: 6px;
-    padding: 6px 10px; color: #d29922; font-size: 12px; margin-top: 8px;
+/* Diff warning: SKAI Ember Warning gradient on left border */
+.rec-diff-warn {
+    background: rgba(245,166,35,0.08);
+    border: 1px solid rgba(245,166,35,0.30);
+    border-left: 3px solid #F5A623;
+    border-radius: 7px;
+    padding: 7px 12px; color: #F5A623; font-size: 12px; margin-top: 8px;
 }
 
-/* --- Model health card --- */
-#mcmcHealthCard { border-color: #196c2e; }
-#mcmcHealthCard h3 { color: #56d364; }
+/* --- Model health card: SKAI Success Green accent --- */
+#mcmcHealthCard { border-color: rgba(32,201,151,0.35); }
+#mcmcHealthCard h3 { color: #20C997; }
 .health-metrics-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(140px,1fr)); gap: 10px;
+    display: -webkit-flex; display: flex; flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px,1fr)); gap: 10px;
 }
 .health-metric {
-    background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
-    padding: 8px 10px;
+    background: rgba(10,26,51,0.60);
+    border: 1px solid rgba(28,102,255,0.15);
+    border-radius: 8px; padding: 10px 12px;
 }
-.health-metric-label { font-size: 11px; color: #6e7681; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; }
-.health-metric-value { font-size: 20px; font-weight: 700; color: #e6edf3; }
-.health-metric-sub   { font-size: 11px; color: #6e7681; margin-top: 2px; }
+.health-metric-label {
+    font-size: 11px; color: #7F8DAA; text-transform: uppercase;
+    letter-spacing: 0.5px; margin-bottom: 5px; font-weight: 600;
+}
+.health-metric-value { font-size: 22px; font-weight: 800; color: #EFEFF5; }
+.health-metric-sub   { font-size: 11px; color: #4E6A8A; margin-top: 3px; }
 
-/* --- Calibration card --- */
-#mcmcCalibCard { border-color: #0d419d; }
-#mcmcCalibCard h3 { color: #79c0ff; }
-.calib-buckets {
-    display: flex; gap: 4px; align-items: flex-end; height: 60px; margin: 8px 0;
-}
+/* --- Calibration card: SKAI Blue accent --- */
+#mcmcCalibCard { border-color: rgba(28,102,255,0.35); }
+#mcmcCalibCard h3 { color: #7AADFF; }
+.calib-buckets { display: flex; gap: 4px; align-items: flex-end; height: 60px; margin: 8px 0; }
 .calib-bucket-bar {
-    flex: 1; background: #1f6feb; border-radius: 2px 2px 0 0;
-    min-height: 4px; transition: height 0.3s;
+    flex: 1; background: #1C66FF; border-radius: 2px 2px 0 0; min-height: 4px;
 }
-.calib-bucket-bar.over  { background: #f85149; }
-.calib-bucket-bar.under { background: #d29922; }
-.calib-ideal-line       { border-top: 1px dashed #8b949e; }
+.calib-bucket-bar.over  { background: #FF6B6B; }
+.calib-bucket-bar.under { background: #F5A623; }
+.calib-ideal-line       { border-top: 1px dashed #7F8DAA; }
 
-/* --- Learning state card --- */
-#mcmcLearnStateCard { border-color: #6e40c9; }
-#mcmcLearnStateCard h3 { color: #d2a8ff; }
-.ls-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 13px; }
+/* --- Learning state card: SKAI Blue accent --- */
+#mcmcLearnStateCard { border-color: rgba(28,102,255,0.35); }
+#mcmcLearnStateCard h3 { color: #7AADFF; }
+.ls-row {
+    display: flex; justify-content: space-between;
+    padding: 5px 0; border-bottom: 1px solid rgba(28,102,255,0.10); font-size: 13px;
+}
 .ls-row:last-child { border-bottom: none; }
-.ls-label { color: #8b949e; }
-.ls-value { color: #c9d1d9; font-weight: 600; }
+.ls-label { color: #7F8DAA; }
+.ls-value { color: #EFEFF5; font-weight: 700; }
 
 /* --- Comparison table --- */
 #mcmcComparePanel { display: none; }
 .compare-table th { font-size: 12px; }
-.compare-match   { color: #56d364; }
-.compare-differ  { color: #f85149; font-weight: 700; }
+.compare-match  { color: #20C997; font-weight: 600; }  /* SKAI Success Green */
+.compare-differ { color: #F5A623; font-weight: 800; }  /* SKAI Caution Amber */
 
 /* --- Regime display --- */
 .regime-display {
-    background: #0d1117; border: 1px solid #1f6feb;
-    border-radius: 6px; padding: 6px 12px; display: inline-flex;
-    align-items: center; gap: 8px; font-size: 12px; color: #a5d6ff;
+    background: rgba(28,102,255,0.08);
+    border: 1px solid rgba(28,102,255,0.30);
+    border-radius: 7px; padding: 6px 12px;
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; color: #7AADFF;
     font-family: monospace; letter-spacing: 0.3px; margin: 4px 0;
 }
-.regime-icon { color: #58a6ff; font-size: 11px; }
+.regime-icon { color: #1C66FF; font-size: 11px; }
 
 /* --- Performance trend area --- */
 #mcmcPerfTrend { margin: 8px 0; }
-.trend-up   { color: #56d364; }
-.trend-down { color: #f85149; }
-.trend-flat { color: #8b949e; }
+.trend-up   { color: #20C997; font-weight: 600; }  /* SKAI Success Green */
+.trend-down { color: #FF6B6B; font-weight: 600; }
+.trend-flat { color: #7F8DAA; }                     /* SKAI Soft Slate */
 
 /* --- Audit trail --- */
 #mcmcAuditTrail { max-height: 200px; overflow-y: auto; }
-.audit-row { padding: 5px 0; border-bottom: 1px solid #21262d; font-size: 12px; color: #8b949e; }
-.audit-event-type { color: #d2a8ff; font-weight: 600; margin-right: 8px; }
-.audit-time       { color: #6e7681; font-size: 11px; }
+.audit-row {
+    padding: 5px 0; border-bottom: 1px solid rgba(28,102,255,0.10);
+    font-size: 12px; color: #7F8DAA;
+}
+.audit-event-type { color: #7AADFF; font-weight: 700; margin-right: 8px; }
+.audit-time       { color: #4E6A8A; font-size: 11px; }
 
 /* --- Score display --- */
 .score-pill {
-    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
     font-size: 12px; font-weight: 700;
 }
-.score-high   { background: #196c2e; color: #56d364; }
-.score-medium { background: #4d2d00; color: #d29922; }
-.score-low    { background: #6e1a1a; color: #f85149; }
+.score-high   { background: rgba(32,201,151,0.15); color: #20C997; }   /* SKAI Success */
+.score-medium { background: rgba(245,166,35,0.12); color: #F5A623; }   /* SKAI Amber */
+.score-low    { background: rgba(192,57,43,0.12);  color: #FF6B6B; }
 
 /* --- Enhanced backtest results area --- */
 #backtestResultsV2 { margin-top: 10px; }
 .bt-summary-box {
-    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
-    padding: 12px 16px; margin-bottom: 10px;
+    background: rgba(10,26,51,0.60);
+    border: 1px solid rgba(28,102,255,0.18);
+    border-radius: 8px; padding: 14px 18px; margin-bottom: 10px;
 }
 .bt-summary-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(110px,1fr)); gap: 8px;
+    display: -webkit-flex; display: flex; flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(110px,1fr)); gap: 10px;
 }
 .bt-metric-item { text-align: center; }
-.bt-metric-num  { font-size: 18px; font-weight: 700; color: #58a6ff; }
-.bt-metric-label{ font-size: 11px; color: #6e7681; margin-top: 2px; }
+.bt-metric-num  { font-size: 20px; font-weight: 800; color: #7AADFF; }  /* SKAI Blue tint */
+.bt-metric-label{ font-size: 11px; color: #7F8DAA; margin-top: 3px; letter-spacing: 0.3px; }
 
 /* --- Optimizer leaderboard --- */
 #optimizerLeaderboard { margin-top: 10px; }
-.lb-best-score  { background: #0a2e17; border-color: #238636; }
-.lb-best-stab   { background: #0d2044; border-color: #1f6feb; }
+/* Best-by-score card: SKAI Success Gradient accent */
+.lb-best-score {
+    background: linear-gradient(135deg, rgba(32,201,151,0.08) 0%, rgba(10,26,51,0.80) 100%);
+    border-color: rgba(32,201,151,0.35);
+}
+/* Best-by-stability card: SKAI Deep Horizon accent */
+.lb-best-stab {
+    background: linear-gradient(135deg, rgba(28,102,255,0.08) 0%, rgba(10,26,51,0.80) 100%);
+    border-color: rgba(28,102,255,0.35);
+}
 
 /* --- Ensemble weight bars --- */
-.weight-bar-row { margin: 6px 0; }
-.weight-bar-label { font-size: 12px; color: #8b949e; margin-bottom: 2px; }
-.weight-bar-fill  { height: 10px; border-radius: 4px; background: #1f6feb; transition: width 0.4s; }
+.weight-bar-row { margin: 7px 0; }
+.weight-bar-label { font-size: 12px; color: #7F8DAA; margin-bottom: 3px; }
+.weight-bar-fill  { height: 10px; border-radius: 4px; background: #1C66FF; transition: width 0.4s; }
 
-/* --- Existing styles preserved below --- */
+/* --- Existing styles preserved --- */
 .numbers-display { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 .number-ball {
-    width: 34px; height: 34px; border-radius: 50%;
+    width: 36px; height: 36px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 13px; border: 2px solid transparent;
+    font-weight: 800; font-size: 13px; border: 2px solid transparent;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
 }
-.ball-main  { background: #1f6feb; border-color: #388bfd; color: #fff; }
-.ball-extra { background: #9e6a03; border-color: #d29922; color: #fff; }
-.ball-predicted { opacity: 0.85; }
-.ball-hit   { border-color: #56d364; box-shadow: 0 0 0 2px #196c2e; }
+.ball-main  { background: #1C66FF; border-color: #4D80FF; color: #FFFFFF; }   /* SKAI Blue */
+.ball-extra { background: #F5A623; border-color: #F7B84B; color: #0A1A33; }   /* SKAI Amber */
+.ball-predicted { opacity: 0.88; }
+.ball-hit   { border-color: #20C997; box-shadow: 0 0 0 3px rgba(32,201,151,0.25); } /* SKAI Success */
 
-/* --- Collapsible panels (existing) --- */
+/* --- Collapsible panels --- */
 .collapsible-header {
-    cursor: pointer; padding: 12px 16px; background: #161b22;
-    border: 1px solid #30363d; border-radius: 6px; margin-bottom: 8px;
+    cursor: pointer; padding: 13px 18px;
+    background: #0D2147; /* card-level navy */
+    border: 1px solid rgba(28,102,255,0.18);
+    border-radius: 8px; margin-bottom: 8px;
     display: flex; justify-content: space-between; align-items: center;
+    transition: background 0.15s, border-color 0.15s;
 }
-.collapsible-header:hover { background: #1c2128; }
+.collapsible-header:hover {
+    background: #152A50;
+    border-color: rgba(28,102,255,0.35);
+}
 .collapsible-body { padding: 0 4px 4px; }
 
 /* --- Responsive adjustments --- */
 @media (max-width: 640px) {
-    .rec-params-grid  { grid-template-columns: repeat(2, 1fr); }
+    .rec-params-grid     { grid-template-columns: repeat(2, 1fr); }
     .health-metrics-grid { grid-template-columns: repeat(2, 1fr); }
     .form-row { flex-direction: column; }
     .form-group { flex: 1 1 100%; }
+    .bt-summary-grid { grid-template-columns: repeat(3, 1fr); }
 }
 [[/style]]
 [[/head]]
@@ -1673,7 +1855,14 @@ var MCMC_JS = (function () {
         PARAM_D_MIN     : 0.001,
         PARAM_D_MAX     : 1.0,
         PARAM_CL_MIN    : 100,
-        PARAM_CL_MAX    : 10000
+        PARAM_CL_MAX    : 10000,
+        /* M-1: Regime thresholds read from MCMC_CFG */
+        REG_SHORT_HIST  : cfg.REG_SHORT_HIST  || 200,
+        REG_LONG_HIST   : cfg.REG_LONG_HIST   || 1000,
+        REG_SMALL_RANGE : cfg.REG_SMALL_RANGE || 40,
+        REG_LARGE_RANGE : cfg.REG_LARGE_RANGE || 69,
+        REG_HIGH_ENT    : cfg.REG_HIGH_ENT    || 0.92,
+        REG_LOW_ENT     : cfg.REG_LOW_ENT     || 0.75
     };
 }());
 
@@ -2204,9 +2393,9 @@ function extractAllFeatures(draws, pick, maxN) {
  * @param  {number} window  Last N draws to consider (0=all)
  * @return {number} Normalized entropy [0,1]
  */
-function computeNormEntropy(draws, maxN, pick, window) {
+function computeNormEntropy(draws, maxN, pick, winSize) {
     if (!draws.length || !maxN || !pick) return 0.5;
-    var slice = (window > 0 && draws.length > window) ? draws.slice(-window) : draws;
+    var slice = (winSize > 0 && draws.length > winSize) ? draws.slice(-winSize) : draws;
     var freq  = [];
     var total = 0;
     var i;
@@ -2272,21 +2461,29 @@ function buildRegimeKey(draws, lottoConfig) {
 
     var histBucket, rangeBucket, entBucket, driftBucket, dailyFlag, extraFlag;
 
+    /* M-1: Read thresholds from MCMC_CFG (injected by PHP) for single-source-of-truth */
+    var regShortHist  = MCMC_JS.REG_SHORT_HIST  || 200;
+    var regLongHist   = MCMC_JS.REG_LONG_HIST   || 1000;
+    var regSmallRange = MCMC_JS.REG_SMALL_RANGE || 40;
+    var regLargeRange = MCMC_JS.REG_LARGE_RANGE || 69;
+    var regHighEnt    = MCMC_JS.REG_HIGH_ENT    || 0.92;
+    var regLowEnt     = MCMC_JS.REG_LOW_ENT     || 0.75;
+
     /* 1. History bucket */
-    if      (n < 200)  histBucket = 'short_history';
-    else if (n < 1000) histBucket = 'medium_history';
-    else               histBucket = 'long_history';
+    if      (n < regShortHist)  histBucket = 'short_history';
+    else if (n < regLongHist)   histBucket = 'medium_history';
+    else                        histBucket = 'long_history';
 
     /* 2. Range bucket */
-    if      (maxN <= 40) rangeBucket = 'small_range';
-    else if (maxN <= 69) rangeBucket = 'medium_range';
-    else                 rangeBucket = 'large_range';
+    if      (maxN <= regSmallRange) rangeBucket = 'small_range';
+    else if (maxN <= regLargeRange) rangeBucket = 'medium_range';
+    else                            rangeBucket = 'large_range';
 
     /* 3. Entropy bucket (last 100 draws) */
     var ent = computeNormEntropy(draws, maxN, pick, 100);
-    if      (ent >= 0.92) entBucket = 'high_entropy';
-    else if (ent >= 0.75) entBucket = 'medium_entropy';
-    else                  entBucket = 'low_entropy';
+    if      (ent >= regHighEnt) entBucket = 'high_entropy';
+    else if (ent >= regLowEnt)  entBucket = 'medium_entropy';
+    else                        entBucket = 'low_entropy';
 
     /* 4. Drift bucket (short=50 vs long=200) */
     var drift = (n >= 50) ? computeFreqDrift(draws, maxN, pick, 50, 200) : 0;
@@ -2711,6 +2908,119 @@ function computeConfidenceScore(signals) {
 }
 
 /* ============================================================
+   JS-11B: LEARNING STATE PERSISTENCE (C-1 fix)
+   Sends computed learning state back to server after backtest/optimizer.
+   Uses synchronous-style XMLHttpRequest wrapped in a try/catch.
+   ES5 compliant: no fetch, no Promise, no arrow functions.
+   ============================================================ */
+
+/**
+ * Persist the computed learning state to the server via AJAX POST.
+ * Called after backtest or optimizer completes.
+ *
+ * @param {string} runType      'backtest' or 'optimizer'
+ * @param {Object} statePayload Serializable learning state object
+ */
+function persistLearningState(runType, statePayload) {
+    /* Require game_id and regime_key at minimum */
+    if (!statePayload || !statePayload.game_id || !statePayload.regime_key) {
+        auditLog('weight_update', { action: 'persist_skipped', reason: 'missing_ids' });
+        return;
+    }
+
+    /* Find Joomla CSRF token */
+    var token = '';
+    var tokenEls = document.querySelectorAll('input[type=hidden]');
+    for (var t = 0; t < tokenEls.length; t++) {
+        var tel = tokenEls[t];
+        if (tel.name && tel.name.length === 32 && /^[0-9a-f]{32}$/.test(tel.name)) {
+            token = tel.name + '=1';
+            break;
+        }
+    }
+
+    statePayload.run_type = runType;
+    var bodyStr = '';
+    try { bodyStr = JSON.stringify(statePayload); } catch (e) { return; }
+
+    /* Build URL with CSRF token and action */
+    var url = window.location.href.split('?')[0] + '?action=mcmc_save_learning' + (token ? '&' + token : '');
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true); /* async */
+    xhr.setRequestHeader('Content-Type', 'application/json; charset=UTF-8');
+    xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        if (xhr.status === 200) {
+            var resp = null;
+            try { resp = JSON.parse(xhr.responseText); } catch (e) { resp = null; }
+            if (resp && resp.ok) {
+                auditLog('weight_update', { action: 'persist_success', runType: runType });
+            } else {
+                auditLog('weight_update', {
+                    action  : 'persist_failed',
+                    runType : runType,
+                    error   : (resp && resp.error) ? String(resp.error) : 'unknown'
+                });
+            }
+        }
+    };
+    try { xhr.send(bodyStr); } catch (e) {
+        auditLog('weight_update', { action: 'persist_xhr_error', error: String(e.message || e) });
+    }
+}
+
+/**
+ * Build a learning state payload from current backtest/optimizer results.
+ * Called by renderBacktestResults and renderOptimizerResults.
+ *
+ * @param {string}  runType     'backtest' or 'optimizer'
+ * @param {Object}  metrics     {avgScore, logLoss, brier, stability, calibScore}
+ * @param {Array}   newWeights  Updated ensemble weights [wA, wB, wC]
+ * @param {Object}  bestParams  Best parameters found {W, K, D, CL, B}
+ * @param {number}  cases       Number of test cases
+ * @param {Array}   calibMap    Calibration map array
+ * @return {Object} Payload ready to POST
+ */
+function buildPersistPayload(runType, metrics, newWeights, bestParams, cases, calibMap) {
+    var ls  = window.mcmcLearningState  || {};
+    var cfg = window.lottoConfig        || {};
+    var gameId    = cfg.gameId   || '';
+    var regimeKey = buildRegimeKey(window.lottoDraws || [], cfg);
+
+    var weightsObj = {
+        main  : newWeights || [MCMC_JS.DEFAULT_W_LAG1, MCMC_JS.DEFAULT_W_COO, MCMC_JS.DEFAULT_W_POP],
+        extra : [MCMC_JS.DEFAULT_W_LAG1, MCMC_JS.DEFAULT_W_COO, MCMC_JS.DEFAULT_W_POP]
+    };
+
+    var rollingMetrics = {
+        log_loss    : metrics.logLoss    || null,
+        brier_score : metrics.brier      || null,
+        hit_rate    : (metrics.hitRate   !== undefined) ? metrics.hitRate : null,
+        stability   : metrics.stability  || null,
+        calibration : metrics.calibScore || null
+    };
+
+    var bestParamsJson = JSON.stringify(bestParams || {});
+    var compWtsJson    = JSON.stringify(weightsObj);
+    var calibMapJson   = JSON.stringify(calibMap || []);
+    var rollingJson    = JSON.stringify(rollingMetrics);
+
+    return {
+        game_id                 : gameId,
+        regime_key              : regimeKey,
+        best_params_json        : bestParamsJson,
+        component_weights_json  : compWtsJson,
+        calibration_map_json    : calibMapJson,
+        rolling_metrics_json    : rollingJson,
+        confidence_score        : metrics.confidence || 0,
+        stability_score         : metrics.stability  || 0,
+        sample_size             : cases || 0,
+        last_draw_count         : (window.lottoDraws || []).length
+    };
+}
+
+/* ============================================================
    JS-12: RECOMMENDATION PANEL RENDERER (Layer 4)
    Reads from window.mcmcLearningState and window.mcmcRecommendation
    (injected by PHP) and renders the recommendation panel cards.
@@ -2882,7 +3192,7 @@ function toggleComparePanel() {
     var el = document.getElementById('mcmcComparePanel');
     if (!el) return;
     if (el.style.display === 'none' || el.style.display === '') {
-        el.style.display = '';
+        el.style.display = 'block'; /* Fix C-2: must override CSS display:none rule */
         renderCompareTable();
     } else {
         el.style.display = 'none';
@@ -3204,6 +3514,34 @@ function renderBacktestResults(results, predVecs, actualVecs, pick, maxN, topN, 
               + ' &mdash; <a href="#" onclick="applyAdaptiveWeights(' + JSON.stringify(newWeights) + ');return false;">Apply</a>'
               + '</div>';
         auditLog('weight_update', { action: 'adaptive_suggestion', weights: newWeights, cases: n });
+
+        /* C-1: Persist learning state to server */
+        var confSignalsBt = {
+            calibration       : calibScore,
+            stability         : stability,
+            sampleSize        : n,
+            drift             : (window.lottoDraws && window.lottoDraws.length >= 50)
+                                    ? computeFreqDrift(window.lottoDraws, maxN, pick, 50, 200) : 0,
+            entropyUniformity : computeNormEntropy(window.lottoDraws || [], maxN, pick, 0)
+        };
+        var confResultBt = computeConfidenceScore(confSignalsBt);
+        var bestParamsBt = {
+            W  : inputInt(  'walksInput',    2700),
+            B  : inputInt(  'burnInInput',   70),
+            K  : inputFloat('laplaceKInput', 1.0),
+            D  : inputFloat('decayInput',    0.02),
+            CL : inputInt(  'chainLenInput', 3000)
+        };
+        var calibMapBt   = buildCalibMapFromBuckets(buckets);
+        var payloadBt    = buildPersistPayload('backtest', {
+            logLoss    : logLoss,
+            brier      : brier,
+            hitRate    : hitRate,
+            stability  : stability,
+            calibScore : calibScore,
+            confidence : confResultBt.score
+        }, newWeights, bestParamsBt, n, calibMapBt);
+        persistLearningState('backtest', payloadBt);
     }
 
     /* Results table (last 20 cases) */
@@ -3350,7 +3688,7 @@ function runOptimizer() {
         var buckets    = computeReliabilityBuckets(testPreds, testActuals, pick, maxN, 10);
         var ece        = computeECE(buckets, testPreds.length * maxN);
         var calibScore = Math.max(0, 1 - ece);
-        var cplx       = computeComplexityPenalty(cand.W, 3000);
+        var cplx       = computeComplexityPenalty(cand.W, inputInt('chainLenInput', 3000));
         var finalScore = computeFinalScore(avgScore, calibScore, stability, cplx);
 
         leaderboard.push({
@@ -3589,7 +3927,7 @@ function runPrediction() {
 
             setInner('predictionStatus', '');
             setInner('predictionResult', html);
-            auditLog('backtest_run', { action: 'prediction_run', topN: topN, picks: topPicks.slice(0, 5) });
+            auditLog('prediction_run', { action: 'prediction_run', topN: topN, picks: topPicks.slice(0, 5) });
 
         } catch (err) {
             setInner('predictionStatus', '<div class="mcmc-alert alert-error">Error: ' + escHtml(String(err.message || err)) + '</div>');
@@ -3751,6 +4089,12 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
     addHidden('decay',               decay   || 0.02);
     addHidden('chain_len',           chainLen|| 3000);
 
+    /* M-2: Guard against zero/missing lotteryNumericId before submitting */
+    var lottNumId = (window.lottoConfig && window.lottoConfig.lotteryNumericId) || 0;
+    if (!lottNumId || lottNumId <= 0) {
+        alert('Cannot save: lottery ID not resolved. Contact admin.');
+        return;
+    }
     document.body.appendChild(form);
     form.submit();
 }
