@@ -2013,19 +2013,20 @@ function fmt(v, n) {
     return parseFloat(v).toFixed(n);
 }
 
-/* Escape HTML to prevent XSS in innerHTML assignments */
+/* Escape HTML to prevent XSS in innerHTML assignments.
+   Uses split/join instead of regex so that no regex literal containing a quote
+   character can be mangled by Joomla content-security filters, which would cause
+   a "string literal contains an unescaped line break" JS syntax error. */
 function escHtml(str) {
     if (str === null || str === undefined) return '';
-    /* Encode &, <, >, ", ', and ` to prevent XSS in all HTML contexts.
-       Backtick is encoded as &#96; to prevent attribute injection in
-       older browsers. Replacements applied in order to prevent double-encoding. */
-    return String(str)
-        .replace(/&/g,  '&amp;')
-        .replace(/</g,  '&lt;')
-        .replace(/>/g,  '&gt;')
-        .replace(/"/g,  '&quot;')
-        .replace(/'/g,  '&#39;')
-        .replace(/`/g,  '&#96;');
+    str = String(str);
+    str = str.split('&').join('&amp;');
+    str = str.split('<').join('&lt;');
+    str = str.split('>').join('&gt;');
+    str = str.split('"').join('&quot;');
+    str = str.split("'").join('&#39;');
+    str = str.split('`').join('&#96;');
+    return str;
 }
 
 /* Build plain object as hash-set from array */
