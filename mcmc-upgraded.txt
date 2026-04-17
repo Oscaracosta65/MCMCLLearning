@@ -3089,10 +3089,14 @@ function persistLearningState(runType, statePayload) {
             break;
         }
     }
-    /* Warn in console if no CSRF token was found (aids debugging if Joomla
-       changes its token format or the page is rendered outside Joomla context) */
-    if (!token && typeof console !== 'undefined' && console.warn) {
-        console.warn('[MCMC] persistLearningState: CSRF token not found — request may be rejected by server.');
+    /* Abort silently if no CSRF token found — the server would reject the request
+       anyway. Log to console to aid debugging if Joomla changes its token format. */
+    if (!token) {
+        auditLog('weight_update', { action: 'persist_skipped', reason: 'no_csrf_token' });
+        if (typeof console !== 'undefined' && console.warn) {
+            console.warn('[MCMC] persistLearningState: CSRF token not found — persist aborted.');
+        }
+        return;
     }
 
     statePayload.run_type = runType;
@@ -3100,7 +3104,7 @@ function persistLearningState(runType, statePayload) {
     try { bodyStr = JSON.stringify(statePayload); } catch (e) { return; }
 
     /* Build URL with CSRF token and action */
-    var url = window.location.href.split('?')[0] + '?action=mcmc_save_learning' + (token ? '&' + token : '');
+    var url = window.location.href.split('?')[0] + '?action=mcmc_save_learning&' + token;
 
     var xhr = new XMLHttpRequest();
     xhr.open('POST', url, true); /* async */
@@ -4256,7 +4260,9 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
     }
 
     /* Joomla CSRF token: find by name length=32 AND all hex characters.
-       This is more robust than length alone and matches Joomla's token format. */
+       This is more robust than length alone and matches Joomla's token format.
+       Guard: if no token found, abort the form submit — the server would reject
+       the request with a CSRF error, giving the user a confusing blank response. */
     var tokenFound = false;
     var tokenEls = document.querySelectorAll('input[type=hidden]');
     for (var t = 0; t < tokenEls.length; t++) {
@@ -4267,8 +4273,9 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
             break;
         }
     }
-    if (!tokenFound && typeof console !== 'undefined' && console.warn) {
-        console.warn('[MCMC] savePrediction: CSRF token not found — form submission may be rejected.');
+    if (!tokenFound) {
+        alert('Cannot save: security token not found. Please reload the page and try again.');
+        return;
     }
 
     addHidden('save_set',       '1');
