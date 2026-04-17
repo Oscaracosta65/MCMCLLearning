@@ -1644,7 +1644,7 @@ a:hover { text-decoration: underline; color: #A8C8FF; }
 
 <!-- Page header: lottery name (filled by JS from window.lottoConfig.lotteryName) -->
 [[div class="mcmc-card" style="background:linear-gradient(135deg,#0A1A33 0%,#1C66FF 100%);margin-bottom:16px;"]]
-  [[h1 id="lotteryTitle" style="font-size:22px;font-weight:700;color:#EFEFF5;margin:0 0 4px;"]]Loading...[[/h1]]
+  [[h1 id="lotteryTitle" aria-live="polite" style="font-size:22px;font-weight:700;color:#EFEFF5;margin:0 0 4px;"]]Loading...[[/h1]]
   [[div id="lotteryDetails" style="font-size:13px;color:#7F8DAA;"]]Loading configuration...[[/div]]
 [[/div]]
 
@@ -2851,17 +2851,16 @@ function computeRankOverlap(listA, listB) {
  * @return {number} Penalty in [0,1]
  */
 function computeComplexityPenalty(walks, chainLen) {
-    /* maxComplexity: product of the maximum allowed walks (40000) and maximum
-       allowed chain length (10000). This gives the upper bound for the
-       complexity product = 400,000,000. Defined here as a named constant to
-       match the central config block param bounds (walks max=40000, CL max=10000). */
-    var MAX_WALKS     = 40000;
-    var MAX_CHAIN_LEN = 10000;
-    var maxComplexity = MAX_WALKS * MAX_CHAIN_LEN;  // 400,000,000
+    /* maxComplexity: product of the maximum allowed walks and maximum allowed
+       chain length, read from MCMC_JS central config (single-source-of-truth
+       that mirrors the PHP MCMC_PARAM_W_MAX / MCMC_PARAM_CL_MAX constants). */
+    var maxWalks    = MCMC_JS.PARAM_W_MAX  || 40000;
+    var maxChainLen = MCMC_JS.PARAM_CL_MAX || 10000;
+    var maxComplexity = maxWalks * maxChainLen;
     var complexity = Math.max(0, walks * chainLen);
     var raw = complexity / maxComplexity;
     /* Log scale: penalizes very high complexity without over-penalizing mid-range.
-       At max complexity (walks=40000, CL=10000): penalty=1.0.
+       At max complexity: penalty=1.0.
        At typical (walks=2700, CL=3000): raw=0.02, penalty~0.17 — very mild. */
     return Math.min(1, Math.log(1 + raw * 100) / Math.log(101));
 }
@@ -3089,6 +3088,11 @@ function persistLearningState(runType, statePayload) {
             token = tel.name + '=1';
             break;
         }
+    }
+    /* Warn in console if no CSRF token was found (aids debugging if Joomla
+       changes its token format or the page is rendered outside Joomla context) */
+    if (!token && typeof console !== 'undefined' && console.warn) {
+        console.warn('[MCMC] persistLearningState: CSRF token not found — request may be rejected by server.');
     }
 
     statePayload.run_type = runType;
@@ -4253,13 +4257,18 @@ function savePrediction(mainNums, extraNums, label, generatedAt, walks, burnIn, 
 
     /* Joomla CSRF token: find by name length=32 AND all hex characters.
        This is more robust than length alone and matches Joomla's token format. */
+    var tokenFound = false;
     var tokenEls = document.querySelectorAll('input[type=hidden]');
     for (var t = 0; t < tokenEls.length; t++) {
         var tel = tokenEls[t];
         if (tel.name && tel.name.length === 32 && /^[0-9a-f]{32}$/.test(tel.name)) {
             addHidden(tel.name, tel.value);
+            tokenFound = true;
             break;
         }
+    }
+    if (!tokenFound && typeof console !== 'undefined' && console.warn) {
+        console.warn('[MCMC] savePrediction: CSRF token not found — form submission may be rejected.');
     }
 
     addHidden('save_set',       '1');
