@@ -714,6 +714,27 @@ if (!function_exists('mcmcGetMigrationSQL')) {
   KEY `idx_ma_created`    (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
 
+/* ===========================================================================
+   Table 7 — REQUIRED DB MIGRATION: extend #__user_saved_numbers
+   These are individual ADD COLUMN statements; each may fail silently (IGNORE)
+   if the column already exists in a re-run. The migration endpoint wraps
+   every statement in try/catch, so idempotency is guaranteed.
+   Insertion point: appended to mcmcGetMigrationSQL() return array.
+   Why: SECTION 15 (save prediction) now inserts 8 new structured metadata
+   columns that were not present in the original 15-column schema.
+   Backward compat risk addressed: if the migration has NOT been run yet the
+   save handler will gracefully fall back to the original 15-column insert
+   (see the try/catch fallback in SECTION 15).
+   =========================================================================== */
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `draws_analyzed`       INT NOT NULL DEFAULT 0         AFTER `chain_len`",
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `prediction_family`    VARCHAR(16) NOT NULL DEFAULT 'regular' AFTER `draws_analyzed`",
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `prediction_type`      VARCHAR(64) NOT NULL DEFAULT '' AFTER `prediction_family`",
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `render_mode`          VARCHAR(32) NOT NULL DEFAULT 'regular_main_extra' AFTER `prediction_type`",
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `settings_json`        LONGTEXT NULL                  AFTER `render_mode`",
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `save_schema_version`  VARCHAR(16) NOT NULL DEFAULT 'v1' AFTER `settings_json`",
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `target_game_id`       VARCHAR(64) NOT NULL DEFAULT '' AFTER `save_schema_version`",
+"ALTER TABLE `#__user_saved_numbers` ADD COLUMN `target_lottery_id`    INT NOT NULL DEFAULT 0         AFTER `target_game_id`",
+
         ];
     }
 }
@@ -980,6 +1001,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken() && isset($_P
     $targetGameId     = $db->quote((string)($gameDbId ?? $gameId));
     $targetLotteryId  = (int)$lottery;  /* already validated > 0 above */
 
+    /* -----------------------------------------------------------------------
+       BACKWARD COMPAT STRATEGY: Try the extended v2 insert first (includes
+       the 8 new columns added by the ALTER TABLE migration). If the columns
+       don't exist yet (migration not run), MySQL throws a "Unknown column"
+       error and we fall back to the original 15-column insert so saves keep
+       working on un-migrated databases.
+       ----------------------------------------------------------------------- */
     $ins = $db->getQuery(true)
         ->insert($db->quoteName('#__user_saved_numbers'))
         ->columns(array_map([$db,'quoteName'], [
@@ -1012,10 +1040,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && JSession::checkToken() && isset($_P
             $targetLotteryId,
         ]));
     try {
-        $db->setQuery($ins); $db->execute();
+        $db->setQuery($ins);
+        $db->execute();
         $app->enqueueMessage('Prediction set saved successfully.');
-        $app->redirect('/my-dashboard'); exit;
-    } catch (\Exception $e) { $app->enqueueMessage('Error saving: '.$e->getMessage(),'error'); }
+        $app->redirect('/my-dashboard');
+        exit;
+    } catch (\Exception $eV2) {
+        /* Detect "Unknown column" error indicating new columns not yet migrated */
+        $dbErrMsg = method_exists($eV2, 'getMessage') ? $eV2->getMessage() : '';
+        $isColErr = (stripos($dbErrMsg, 'Unknown column') !== false
+                  || stripos($dbErrMsg, "doesn't exist")  !== false);
+        if ($isColErr) {
+            /* FALLBACK: original 15-column insert (pre-migration schema) */
+            $insFallback = $db->getQuery(true)
+                ->insert($db->quoteName('#__user_saved_numbers'))
+                ->columns([
+                    'user_id','lottery_id','main_numbers','extra_ball_numbers',
+                    'source','label','generated_at','date_saved','next_draw_date',
+                    'walks','burn_in','laplace_k','decay','chain_len'
+                ])
+                ->values(implode(',', [
+                    (int)$currUser->id,
+                    $targetLotteryId,
+                    $mainNums,
+                    $extraNums,
+                    $src,
+                    $lbl,
+                    $genAt,
+                    $saved,
+                    ($nextDraw !== '' ? $db->quote($nextDraw) : 'NULL'),
+                    $W, $B, $K, $D, $CL,
+                ]));
+            try {
+                $db->setQuery($insFallback);
+                $db->execute();
+                /* Warn that DB migration is needed for full metadata storage */
+                $app->enqueueMessage('Prediction saved (run DB migration for extended metadata).', 'notice');
+                $app->redirect('/my-dashboard');
+                exit;
+            } catch (\Exception $eFb) {
+                $app->enqueueMessage('Error saving prediction: ' . $eFb->getMessage(), 'error');
+            }
+        } else {
+            $app->enqueueMessage('Error saving prediction: ' . $eV2->getMessage(), 'error');
+        }
+    }
 }
 
 // ==============================================================================
